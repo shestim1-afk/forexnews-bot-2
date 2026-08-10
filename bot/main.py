@@ -4,7 +4,7 @@ import time
 
 from . import config
 from .db import is_new, mark_seen, count_seen
-from .collectors import rss_collector, twitter_collector, fred_collector, truthsocial_collector
+from .collectors import rss_collector, twitter_collector, fred_collector, truthsocial_collector, forexfactory_collector
 from . import classifier
 from . import telegram_bot
 
@@ -22,6 +22,7 @@ def collect_all():
     for collector, name in [
         (rss_collector, "rss"),
         (twitter_collector, "twitter"),
+        (forexfactory_collector, "forexfactory_calendar"),
         (truthsocial_collector, "truthsocial"),
         (fred_collector, "fred"),
     ]:
