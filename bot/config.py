@@ -66,6 +66,7 @@ RSS_FEEDS = {
 # trumpstruth.org is a free, actively-maintained public archive with a real
 # RSS feed -- far more reliable than Nitter for this specific account.
 TRUTH_SOCIAL_RSS = "https://www.trumpstruth.org/feed"
+FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # --- Notable X/Twitter accounts to track via free Nitter/RSS-Bridge sources
 # (see twitter_collector.py). Usernames without @.
