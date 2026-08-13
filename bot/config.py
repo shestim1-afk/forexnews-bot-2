@@ -16,7 +16,7 @@ FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")
 
 # --- Tuning ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
-MIN_CONFIDENCE_TO_ALERT = float(os.getenv("MIN_CONFIDENCE_TO_ALERT", "0.55"))
+MIN_CONFIDENCE_TO_ALERT = float(os.getenv("MIN_CONFIDENCE_TO_ALERT", "0.70"))
 MAX_ITEMS_PER_CYCLE = int(os.getenv("MAX_ITEMS_PER_CYCLE", "25"))
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 # Delay between AI classification calls, to stay under free-tier rate limits
