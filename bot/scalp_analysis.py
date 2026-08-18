@@ -41,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scalp_analysis")
 
-SYMBOL = "BTC/USD"  # Twelve Data crypto symbol format
+SYMBOL = "BTC/USD"
 DISPLAY_SYMBOL = "BTC/USD"
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 TIMEFRAMES = {"4h": "4h", "1h": "1h", "15m": "15min", "5m": "5min"}
@@ -121,9 +121,65 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "momentum": momentum,
         "adx": adx,
         "atr": atr,
+        "rsi": rsi,
+        "stochrsi": stochrsi,
         "above_vwap": current_close > vwap,
         "volume_confirmed": current_volume > vol_ma * 1.2 if pd.notna(vol_ma) else False,
     }
+
+
+def find_nearest_levels(df: pd.DataFrame, current_price: float, window: int = 3) -> tuple[float | None, float | None]:
+    highs = df["high"].tolist()
+    lows = df["low"].tolist()
+    swing_highs, swing_lows = [], []
+
+    for i in range(window, len(df) - window):
+        if highs[i] == max(highs[i - window:i + window + 1]):
+            swing_highs.append(highs[i])
+        if lows[i] == min(lows[i - window:i + window + 1]):
+            swing_lows.append(lows[i])
+
+    resistance_candidates = sorted(set(round(h, 2) for h in swing_highs if h > current_price))
+    support_candidates = sorted(set(round(l, 2) for l in swing_lows if l < current_price), reverse=True)
+
+    nearest_resistance = resistance_candidates[0] if resistance_candidates else None
+    nearest_support = support_candidates[0] if support_candidates else None
+    return nearest_support, nearest_resistance
+
+
+def detect_range_setup(tf_data: dict, dfs: dict) -> dict | None:
+    h1 = tf_data["1h"]
+    if h1["adx"] >= 20:
+        return None
+
+    current_price = h1["close"]
+    support, resistance = find_nearest_levels(dfs["1h"], current_price)
+    if support is None or resistance is None:
+        return None
+
+    atr_1h = h1["atr"]
+    m15 = tf_data["15m"]
+
+    near_support = (current_price - support) <= 0.5 * atr_1h
+    near_resistance = (resistance - current_price) <= 0.5 * atr_1h
+
+    if near_support and m15["rsi"] < 35:
+        return {
+            "direction": "LONG",
+            "entry": current_price,
+            "sl": support - 0.5 * atr_1h,
+            "tp": resistance,
+            "reason": f"Near range support ({support:.2f}), RSI(15m)={m15['rsi']:.1f} oversold",
+        }
+    if near_resistance and m15["rsi"] > 65:
+        return {
+            "direction": "SHORT",
+            "entry": current_price,
+            "sl": resistance + 0.5 * atr_1h,
+            "tp": support,
+            "reason": f"Near range resistance ({resistance:.2f}), RSI(15m)={m15['rsi']:.1f} overbought",
+        }
+    return None
 
 
 def get_news_bias() -> tuple[str, str]:
@@ -204,7 +260,7 @@ def compute_trade_levels(action: str, entry: float, atr_5m: float) -> dict:
 LABEL_EMOJI = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
 
 
-def format_message(tf_data: dict, decision: dict, levels: dict, news_direction: str, news_summary: str) -> str:
+def format_message(tf_data: dict, decision: dict, levels: dict, news_direction: str, news_summary: str, range_setup: dict | None) -> str:
     lines = [f"*{DISPLAY_SYMBOL}* — hourly scan\n"]
     for tf_label in ["4h", "1h", "15m", "5m"]:
         d = tf_data[tf_label]
@@ -216,7 +272,7 @@ def format_message(tf_data: dict, decision: dict, levels: dict, news_direction: 
     lines.append("")
 
     action_emoji = {"LONG": "🟢", "SHORT": "🔴", "NO TRADE": "⚪"}[decision["action"]]
-    lines.append(f"{action_emoji} *{decision['action']}*")
+    lines.append(f"{action_emoji} *Trend signal: {decision['action']}*")
 
     if decision["action"] != "NO TRADE":
         lines.append(f"Entry: {levels['entry']:.2f}")
@@ -228,6 +284,19 @@ def format_message(tf_data: dict, decision: dict, levels: dict, news_direction: 
         lines.append(f"4H {tf_data['4h']['trend']} / 1H {tf_data['1h']['trend']}" + (" -- higher timeframes disagree" if not agree else " -- confluence too weak"))
 
     lines.append(f"Confidence: {decision['confidence']}%")
+
+    if range_setup:
+        lines.append("")
+        rs_emoji = "🟢" if range_setup["direction"] == "LONG" else "🔴"
+        lines.append(f"{rs_emoji} *Range setup: {range_setup['direction']}* (support/resistance)")
+        lines.append(range_setup["reason"])
+        lines.append(f"Entry: {range_setup['entry']:.2f}")
+        lines.append(f"SL: {range_setup['sl']:.2f}")
+        lines.append(f"TP: {range_setup['tp']:.2f}")
+    elif tf_data["1h"]["adx"] < 20:
+        lines.append("")
+        lines.append("⚪ Range setup: 1H is ranging, but no level+reversal trigger nearby yet")
+
     lines.append("")
     lines.append("_Heuristic score, not a backtested probability -- signal-only, not financial advice._")
 
@@ -236,21 +305,24 @@ def format_message(tf_data: dict, decision: dict, levels: dict, news_direction: 
 
 async def run():
     tf_data = {}
+    dfs = {}
     for label, interval in TIMEFRAMES.items():
         df = fetch_klines(interval)
         if df is None or len(df) < 205:
             logger.warning("Insufficient data for %s, aborting this cycle", label)
             return
         tf_data[label] = compute_indicators(df)
+        dfs[label] = df
 
     news_direction, news_summary = get_news_bias()
     decision = score_and_decide(tf_data, news_direction)
+    range_setup = detect_range_setup(tf_data, dfs)
 
     entry_price = tf_data["5m"]["close"]
     atr_5m = tf_data["5m"]["atr"]
     levels = compute_trade_levels(decision["action"], entry_price, atr_5m)
 
-    message = format_message(tf_data, decision, levels, news_direction, news_summary)
+    message = format_message(tf_data, decision, levels, news_direction, news_summary, range_setup)
 
     db.save_scalp_signal(
         symbol=DISPLAY_SYMBOL,
@@ -260,11 +332,16 @@ async def run():
         tp1=levels["tp1"],
         tp2=levels["tp2"],
         confidence=decision["confidence"],
-        details=f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']} news={news_direction}",
+        details=f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']} news={news_direction}"
+                + (f" | range={range_setup['direction']}@{range_setup['entry']:.2f}" if range_setup else ""),
     )
 
     await telegram_bot.send_text(message)
-    logger.info("Sent scalp signal: %s (%d%% confidence)", decision["action"], decision["confidence"])
+    logger.info(
+        "Sent scalp signal: trend=%s (%d%%), range=%s",
+        decision["action"], decision["confidence"],
+        range_setup["direction"] if range_setup else "none",
+    )
 
 
 if __name__ == "__main__":
