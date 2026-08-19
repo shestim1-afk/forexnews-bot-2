@@ -63,6 +63,15 @@ def _connect():
         )
         """
     )
+        conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telegram_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+
     return conn
 
 
