@@ -71,6 +71,19 @@ def _connect():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signal_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER,
+            outcome TEXT,
+            exit_price REAL,
+            r_multiple REAL,
+            evaluated_at TEXT
+        )
+        """
+    )
+
 
     return conn
 
