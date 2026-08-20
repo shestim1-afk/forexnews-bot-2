@@ -159,3 +159,79 @@ def save_scalp_signal(symbol: str, action: str, entry: float | None, sl: float |
         conn.commit()
     finally:
         conn.close()
+        
+    def get_unevaluated_signals(min_age_hours: int = 4, max_age_hours: int = 48) -> list[dict]:
+    """Returns actionable (LONG/SHORT) signals old enough to have likely
+    resolved, that don't have an outcome recorded yet. max_age_hours caps how
+    far back we look, so a huge backlog can't overwhelm one run."""
+    conn = _connect()
+    try:
+        cutoff_min = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
+        cutoff_max = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+        cur = conn.execute(
+            """SELECT id, symbol, action, entry, sl, tp1, tp2, confidence, created_at
+               FROM scalp_signals
+               WHERE action != 'NO TRADE'
+                 AND created_at <= ?
+                 AND created_at >= ?
+                 AND id NOT IN (SELECT signal_id FROM signal_outcomes)
+               ORDER BY created_at ASC
+               LIMIT 30""",
+            (cutoff_min, cutoff_max),
+        )
+        cols = ["id", "symbol", "action", "entry", "sl", "tp1", "tp2", "confidence", "created_at"]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def save_signal_outcome(signal_id: int, outcome: str, exit_price: float, r_multiple: float) -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            """INSERT INTO signal_outcomes (signal_id, outcome, exit_price, r_multiple, evaluated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (signal_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_outcome_stats() -> list[dict]:
+    """Aggregate win/loss stats per symbol, across all evaluated signals."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """SELECT s.symbol, o.outcome, o.r_multiple
+               FROM signal_outcomes o
+               JOIN scalp_signals s ON s.id = o.signal_id"""
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    by_symbol: dict[str, dict] = {}
+    for symbol, outcome, r in rows:
+        b = by_symbol.setdefault(symbol, {"wins": 0, "losses": 0, "expired": 0, "r_sum": 0.0, "resolved": 0})
+        if outcome == "WIN":
+            b["wins"] += 1
+            b["r_sum"] += r
+            b["resolved"] += 1
+        elif outcome == "LOSS":
+            b["losses"] += 1
+            b["r_sum"] += r
+            b["resolved"] += 1
+        else:
+            b["expired"] += 1
+
+    result = []
+    for symbol, b in by_symbol.items():
+        win_rate = b["wins"] / b["resolved"] if b["resolved"] else None
+        avg_r = b["r_sum"] / b["resolved"] if b["resolved"] else None
+        result.append({
+            "symbol": symbol, "wins": b["wins"], "losses": b["losses"], "expired": b["expired"],
+            "win_rate": win_rate, "avg_r": avg_r,
+        })
+    return result
+
