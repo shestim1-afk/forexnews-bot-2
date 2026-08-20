@@ -2,7 +2,7 @@ name: Hourly BTC Scalp Analysis
 
 on:
   schedule:
-    - cron: "4 * * * *"
+    - cron: "6,36 * * * *"
   workflow_dispatch: {}
 
 permissions:
