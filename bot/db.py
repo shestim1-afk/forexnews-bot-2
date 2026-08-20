@@ -173,7 +173,7 @@ def save_scalp_signal(symbol: str, action: str, entry: float | None, sl: float |
     finally:
         conn.close()
         
-    def get_unevaluated_signals(min_age_hours: int = 4, max_age_hours: int = 48) -> list[dict]:
+def get_unevaluated_signals(min_age_hours: int = 4, max_age_hours: int = 48) -> list[dict]:
     """Returns actionable (LONG/SHORT) signals old enough to have likely
     resolved, that don't have an outcome recorded yet. max_age_hours caps how
     far back we look, so a huge backlog can't overwhelm one run."""
