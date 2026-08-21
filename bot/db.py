@@ -117,6 +117,22 @@ def _connect():
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE backtest_outcomes ADD COLUMN mae_r REAL")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE backtest_outcomes ADD COLUMN mfe_r REAL")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mae_r REAL")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mfe_r REAL")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -234,13 +250,14 @@ def get_unevaluated_signals(min_age_hours: int = 4, max_age_hours: int = 48) -> 
         conn.close()
 
 
-def save_signal_outcome(signal_id: int, outcome: str, exit_price: float, r_multiple: float) -> None:
+def save_signal_outcome(signal_id: int, outcome: str, exit_price: float, r_multiple: float,
+                         mae_r: float | None = None, mfe_r: float | None = None) -> None:
     conn = _connect()
     try:
         conn.execute(
-            """INSERT INTO signal_outcomes (signal_id, outcome, exit_price, r_multiple, evaluated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (signal_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat()),
+            """INSERT INTO signal_outcomes (signal_id, outcome, exit_price, r_multiple, evaluated_at, mae_r, mfe_r)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (signal_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat(), mae_r, mfe_r),
         )
         conn.commit()
     finally:
@@ -367,13 +384,14 @@ def save_evaluation(source: str, symbol: str, strategy_type: str, action: str, c
         conn.close()
 
 
-def save_backtest_outcome(evaluation_id: int, outcome: str, exit_price: float, r_multiple: float) -> None:
+def save_backtest_outcome(evaluation_id: int, outcome: str, exit_price: float, r_multiple: float,
+                           mae_r: float | None = None, mfe_r: float | None = None) -> None:
     conn = _connect()
     try:
         conn.execute(
-            """INSERT INTO backtest_outcomes (evaluation_id, outcome, exit_price, r_multiple, evaluated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (evaluation_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat()),
+            """INSERT INTO backtest_outcomes (evaluation_id, outcome, exit_price, r_multiple, evaluated_at, mae_r, mfe_r)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (evaluation_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat(), mae_r, mfe_r),
         )
         conn.commit()
     finally:
