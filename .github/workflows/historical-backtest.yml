@@ -14,6 +14,18 @@ on:
         description: "How it should appear in the Telegram message"
         required: false
         default: "BTC/USD"
+      sl_mult:
+        description: "Stop-loss distance, as a multiple of ATR (live bot default: 1.5)"
+        required: false
+        default: "1.5"
+      tp1_mult:
+        description: "TP1 distance, as a multiple of ATR (live bot default: 1.0 -- try 1.5 for a 1:1 R:R test)"
+        required: false
+        default: "1.0"
+      tp2_mult:
+        description: "TP2 distance, as a multiple of ATR (live bot default: 2.0)"
+        required: false
+        default: "2.0"
 
 permissions:
   contents: read
@@ -52,5 +64,11 @@ jobs:
           python -c "
           import asyncio
           from bot.historical_backtest import run
-          asyncio.run(run(api_symbol='${{ github.event.inputs.api_symbol }}', display_symbol='${{ github.event.inputs.display_symbol }}'))
+          asyncio.run(run(
+              api_symbol='${{ github.event.inputs.api_symbol }}',
+              display_symbol='${{ github.event.inputs.display_symbol }}',
+              sl_mult=float('${{ github.event.inputs.sl_mult }}'),
+              tp1_mult=float('${{ github.event.inputs.tp1_mult }}'),
+              tp2_mult=float('${{ github.event.inputs.tp2_mult }}'),
+          ))
           "
