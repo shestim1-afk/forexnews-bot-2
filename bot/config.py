@@ -109,3 +109,9 @@ ASSET_UNIVERSE = {
         "Individual stock (name it)", "US indices (S&P500/Nasdaq/Dow)",
     ],
 }
+
+# --- Position sizing (used by the scalp bot's risk engine) ---
+# These are placeholders -- personalize to your actual account before
+# trusting the position sizes shown in any signal.
+ACCOUNT_SIZE_USD = float(os.getenv("ACCOUNT_SIZE_USD", "1000"))
+RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.0"))
