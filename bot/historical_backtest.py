@@ -19,6 +19,11 @@ later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
 for outcome-checking, since it's self-contained historical data).
+
+sl_mult/tp1_mult/tp2_mult let you A/B test different risk:reward ratios
+against identical historical data -- results are tagged distinctly in the
+database so a variant run never mixes with the baseline numbers for the
+same symbol.
 """
 
 import asyncio
@@ -88,10 +93,25 @@ def slice_up_to(df: pd.DataFrame, cutoff_dt, window: int = WARMUP_BARS) -> pd.Da
     return sliced.iloc[-window:].reset_index(drop=True)
 
 
-def evaluate_at(cutoff_dt, dfs_full: dict) -> tuple[dict, dict, dict | None, str | None, dict | None, dict | None] | None:
+def compute_trade_levels_variant(action: str, entry: float, atr: float, sl_mult: float, tp1_mult: float, tp2_mult: float) -> dict:
+    """Like scalp_analysis.compute_trade_levels, but with configurable
+    SL/TP multipliers -- lets us A/B test different risk:reward ratios
+    against the same historical data without touching the live bot's
+    actual behavior (which stays fixed at 1.5/1.0/2.0 unless you decide
+    to adopt a different ratio permanently)."""
+    if action == "LONG":
+        return {"entry": entry, "sl": entry - sl_mult * atr, "tp1": entry + tp1_mult * atr, "tp2": entry + tp2_mult * atr}
+    elif action == "SHORT":
+        return {"entry": entry, "sl": entry + sl_mult * atr, "tp1": entry - tp1_mult * atr, "tp2": entry - tp2_mult * atr}
+    return {"entry": None, "sl": None, "tp1": None, "tp2": None}
+
+
+def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0) -> tuple[dict, dict, dict | None, str | None, dict | None, dict | None] | None:
     """Runs the exact same indicator/decision logic as the live bot, but on
     data sliced to only what would have been known at cutoff_dt. Returns
-    None if any timeframe doesn't have enough warmup data yet at this point."""
+    None if any timeframe doesn't have enough warmup data yet at this point.
+    sl_mult/tp1_mult/tp2_mult default to the live bot's actual ratios --
+    pass different values to test a variant."""
     tf_data, dfs = {}, {}
     for label in ["4h", "1h", "15m", "5m"]:
         sliced = slice_up_to(dfs_full[label], cutoff_dt)
@@ -108,7 +128,7 @@ def evaluate_at(cutoff_dt, dfs_full: dict) -> tuple[dict, dict, dict | None, str
 
     entry_price = tf_data["5m"]["close"]
     atr_5m = tf_data["5m"]["atr"]
-    levels = scalp_analysis.compute_trade_levels(decision["action"], entry_price, atr_5m)
+    levels = compute_trade_levels_variant(decision["action"], entry_price, atr_5m, sl_mult, tp1_mult, tp2_mult)
 
     return tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest
 
@@ -137,7 +157,11 @@ def find_outcome(df_5m_full: pd.DataFrame, entry_time, entry: float, sl: float, 
     return "EXPIRED", last_close, (profit / risk if risk else 0.0)
 
 
-async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD"):
+async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
+              sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0):
+    is_variant = (sl_mult, tp1_mult, tp2_mult) != (1.5, 1.0, 2.0)
+    result_symbol = f"{display_symbol} (R:R {tp1_mult:.1f}:{sl_mult:.1f})" if is_variant else display_symbol
+
     logger.info("Fetching historical data for %s...", display_symbol)
     dfs_full = {}
     for label, interval in scalp_analysis.TIMEFRAMES.items():
@@ -148,18 +172,17 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD"):
         dfs_full[label] = df
         logger.info("%s: %d candles, from %s to %s", label, len(df), df["datetime"].min(), df["datetime"].max())
 
-    # Bound the replay window to whatever timeframe has the least history
-    # (in practice, 5-minute data, given the free-tier candle-count cap)
     earliest_start = max(df["datetime"].min() for df in dfs_full.values())
     latest_end = min(df["datetime"].max() for df in dfs_full.values())
-    replay_start = earliest_start + timedelta(minutes=WARMUP_BARS * 5)  # ensure warmup for the finest timeframe
-    replay_end = latest_end - timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)  # leave room to check outcomes
+    replay_start = earliest_start + timedelta(minutes=WARMUP_BARS * 5)
+    replay_end = latest_end - timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
 
     if replay_start >= replay_end:
         logger.error("Not enough historical range to replay after accounting for warmup and outcome lookahead")
         return
 
-    logger.info("Replaying from %s to %s in %d-minute steps", replay_start, replay_end, REPLAY_STEP_MINUTES)
+    logger.info("Replaying from %s to %s in %d-minute steps (SL=%.1fx TP1=%.1fx TP2=%.1fx ATR)",
+                replay_start, replay_end, REPLAY_STEP_MINUTES, sl_mult, tp1_mult, tp2_mult)
 
     step = timedelta(minutes=REPLAY_STEP_MINUTES)
     t = replay_start
@@ -167,7 +190,7 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD"):
     actionable_count = 0
 
     while t <= replay_end:
-        result = evaluate_at(t, dfs_full)
+        result = evaluate_at(t, dfs_full, sl_mult, tp1_mult, tp2_mult)
         if result is None:
             t += step
             continue
@@ -175,7 +198,7 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD"):
         tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest = result
 
         eval_id = db.save_evaluation(
-            source="backtest", symbol=display_symbol, strategy_type="trend", action=decision["action"],
+            source="backtest", symbol=result_symbol, strategy_type="trend", action=decision["action"],
             confidence=decision["confidence"], entry=levels["entry"], sl=levels["sl"],
             tp1=levels["tp1"], tp2=levels["tp2"],
             details=f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']}",
@@ -194,8 +217,8 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD"):
 
     logger.info("Backtest complete: %d evaluated, %d actionable", evaluated_count, actionable_count)
 
-    summary = db.get_backtest_summary(display_symbol)
-    lines = [f"*📈 Historical Backtest: {display_symbol}*\n"]
+    summary = db.get_backtest_summary(result_symbol)
+    lines = [f"*📈 Historical Backtest: {result_symbol}*\n"]
     lines.append(f"Period: {replay_start.strftime('%Y-%m-%d')} to {replay_end.strftime('%Y-%m-%d')} ({REPLAY_STEP_MINUTES}-min steps)")
     lines.append(f"Total evaluated: {summary['total_evaluated']} ({summary['no_trade_count']} NO TRADE, {summary['actionable_count']} actionable)")
     if summary["win_rate"] is not None:
