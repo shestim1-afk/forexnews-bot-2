@@ -1,13 +1,13 @@
 """On-demand Telegram command handler. Checks for new messages containing
-commands like /btc, /gold, /gbpjpy, or /help, and replies with a fresh
-analysis for that specific symbol using the same engine as the hourly digest.
+commands like /btc, /gold, /gbpjpy, /stats, or /help, and replies with a
+fresh analysis using the same engine as the scheduled scalp scan.
 
-This is NOT truly instant -- it works by periodically checking Telegram for
-new messages (polling), since a true instant-reply webhook setup needs a
-persistent server or more fragile free-tier workarounds. Run this on a
-frequent schedule (e.g. every 3-5 minutes) via its own GitHub Actions
-workflow, and you'll get a reply within roughly that window of sending a
-command.
+Supports two modes:
+- Short-poll (timeout=0, the default): used by the old GitHub Actions
+  periodic-check workflow. Replies arrive within a few minutes.
+- Long-poll (timeout=25): used by bot/railway_main.py's persistent process.
+  Replies arrive within seconds, since the request stays open waiting for
+  a new message rather than checking briefly on a schedule.
 """
 
 import asyncio
@@ -18,6 +18,7 @@ import requests
 from . import config
 from . import db
 from . import scalp_analysis
+from . import backtest_signals
 from . import telegram_bot
 
 logging.basicConfig(
@@ -38,36 +39,26 @@ HELP_TEXT = (
 
 
 def format_stats_message() -> str:
-    stats = db.get_outcome_stats()
-    if not stats:
-        return "No signals have been evaluated yet. Signals need to be at least 4 hours old before they're checked -- check back once some have had time to play out."
-
-    lines = ["*📊 Win/Loss Record So Far*\n"]
-    for s in stats:
-        if s["win_rate"] is not None:
-            lines.append(
-                f"*{s['symbol']}*: {s['wins']}W / {s['losses']}L "
-                f"({s['win_rate']*100:.0f}% win rate), avg R: {s['avg_r']:+.2f}"
-                + (f", {s['expired']} expired" if s["expired"] else "")
-            )
-        else:
-            lines.append(f"*{s['symbol']}*: no resolved signals yet" + (f" ({s['expired']} expired)" if s["expired"] else ""))
-
-    lines.append("")
-    lines.append("_TP1 vs SL, whichever hit first in 15m candles. Treat with appropriate skepticism until many signals have accumulated._")
-    return "\n".join(lines)
+    return backtest_signals.format_full_stats_message()
 
 
-def get_updates(offset: int | None) -> list[dict]:
+def get_updates(offset: int | None, timeout: int = 0) -> list[dict]:
+    """timeout=0 (default) is a quick, non-blocking check -- used by the
+    old GitHub Actions periodic-check workflow. timeout=25 makes this a
+    genuine Telegram long-poll call (the request blocks server-side until
+    a new message arrives or 25s elapses) -- only viable from a persistent
+    process like Railway, since GitHub Actions jobs can't stay open that
+    way. The HTTP client timeout must exceed Telegram's long-poll timeout,
+    or our own request would time out first."""
     if not config.TELEGRAM_BOT_TOKEN:
         return []
     try:
-        params = {"timeout": 0}
+        params = {"timeout": timeout}
         if offset is not None:
             params["offset"] = offset
         r = requests.get(
             f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getUpdates",
-            params=params, timeout=15,
+            params=params, timeout=timeout + 10,
         )
         r.raise_for_status()
         data = r.json()
@@ -112,7 +103,7 @@ async def reply_to(chat_id: str, text: str) -> None:
 
 
 async def handle_command(chat_id: str, command: str) -> None:
-    command = command.lower().split("@")[0]  # strip @botname if present
+    command = command.lower().split("@")[0]
 
     if command == "/help" or command == "/start":
         await reply_to(chat_id, HELP_TEXT)
@@ -130,12 +121,12 @@ async def handle_command(chat_id: str, command: str) -> None:
     symbol_cfg = next(s for s in scalp_analysis.SYMBOLS if s["api"] == api_symbol)
     await reply_to(chat_id, f"Running fresh analysis for {symbol_cfg['display']}, one moment...")
 
-    block, signal_data, _ = scalp_analysis.analyze_symbol(symbol_cfg)
-    if signal_data:
+    block, actionable_signals, _ = scalp_analysis.analyze_symbol(symbol_cfg)
+    for sig in actionable_signals:
         db.save_scalp_signal(
-            symbol=signal_data["symbol"], action=signal_data["action"],
-            entry=signal_data["entry"], sl=signal_data["sl"], tp1=signal_data["tp1"], tp2=signal_data["tp2"],
-            confidence=signal_data["confidence"], details=signal_data["details"] + " (on-demand)",
+            symbol=sig["symbol"], action=sig["action"], entry=sig["entry"], sl=sig["sl"],
+            tp1=sig["tp1"], tp2=sig["tp2"], confidence=sig["confidence"],
+            details=sig["details"] + " (on-demand)", strategy_type=sig["strategy_type"],
         )
     await reply_to(chat_id, block)
 
