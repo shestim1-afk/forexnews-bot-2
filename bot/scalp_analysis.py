@@ -545,6 +545,18 @@ def analyze_symbol(symbol_cfg: dict) -> tuple[str, list[dict], bool]:
         })
 
     actionable = is_actionable(decision, range_setup, sweep, breakout_retest)
+
+    # Log the primary trend decision EVERY cycle, including NO TRADE ones --
+    # not just the actionable signals above. This is what lets us later ask
+    # whether our filtering is actually improving quality, or just throwing
+    # away good setups along with bad ones.
+    db.save_evaluation(
+        source="live", symbol=display, strategy_type="trend", action=decision["action"],
+        confidence=decision["confidence"], entry=levels["entry"], sl=levels["sl"],
+        tp1=levels["tp1"], tp2=levels["tp2"],
+        details=f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']} news={news_direction}",
+    )
+
     return block, actionable_signals, actionable
 
 
