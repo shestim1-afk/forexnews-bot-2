@@ -1,0 +1,56 @@
+name: Historical Backtest
+
+# Manual-only (no schedule) -- this is a deep, occasional analysis you run
+# when you want it, not something that needs to fire automatically. Choose
+# the symbol when triggering it manually from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      api_symbol:
+        description: "Symbol in Twelve Data format (e.g. BTC/USD, XAU/USD, GBP/JPY)"
+        required: false
+        default: "BTC/USD"
+      display_symbol:
+        description: "How it should appear in the Telegram message"
+        required: false
+        default: "BTC/USD"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  historical-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run historical backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.historical_backtest import run
+          asyncio.run(run(api_symbol='${{ github.event.inputs.api_symbol }}', display_symbol='${{ github.event.inputs.display_symbol }}'))
+          "
