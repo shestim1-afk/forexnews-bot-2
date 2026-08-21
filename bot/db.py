@@ -83,6 +83,10 @@ def _connect():
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE scalp_signals ADD COLUMN strategy_type TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists from a previous run
     return conn
 
 
@@ -155,17 +159,20 @@ def get_recent_classifications(asset_keyword: str, hours: int = 2) -> list[dict]
 
 
 def save_scalp_signal(symbol: str, action: str, entry: float | None, sl: float | None,
-                       tp1: float | None, tp2: float | None, confidence: float, details: str) -> None:
+                       tp1: float | None, tp2: float | None, confidence: float, details: str,
+                       strategy_type: str = "trend") -> None:
     """Logs every scalp signal generated (including NO TRADE calls) with a
     timestamp, so that once enough signals accumulate, we can go back and
     check what price actually did afterward -- the only way to find out if
-    the confidence score means anything real."""
+    the confidence score means anything real. strategy_type tags which
+    engine produced it (trend / range / liquidity_sweep / breakout_retest)
+    so performance can be broken down by approach, not just by symbol."""
     conn = _connect()
     try:
         conn.execute(
-            """INSERT INTO scalp_signals (symbol, action, entry, sl, tp1, tp2, confidence, details, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (symbol, action, entry, sl, tp1, tp2, confidence, details, datetime.now(timezone.utc).isoformat()),
+            """INSERT INTO scalp_signals (symbol, action, entry, sl, tp1, tp2, confidence, details, created_at, strategy_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (symbol, action, entry, sl, tp1, tp2, confidence, details, datetime.now(timezone.utc).isoformat(), strategy_type),
         )
         conn.commit()
     finally:
@@ -211,11 +218,74 @@ def save_signal_outcome(signal_id: int, outcome: str, exit_price: float, r_multi
 
 
 def get_outcome_stats() -> list[dict]:
-    """Aggregate win/loss stats per symbol, across all evaluated signals."""
+    """Aggregate win/loss stats per symbol, including profit factor (gross
+    wins / gross losses -- the standard way to judge a system beyond raw
+    win rate) and max drawdown in R-multiples (worst peak-to-trough decline
+    in the running total, ordered by signal date)."""
     conn = _connect()
     try:
         cur = conn.execute(
-            """SELECT s.symbol, o.outcome, o.r_multiple
+            """SELECT s.symbol, o.outcome, o.r_multiple, s.created_at
+               FROM signal_outcomes o
+               JOIN scalp_signals s ON s.id = o.signal_id
+               ORDER BY s.created_at ASC"""
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    by_symbol: dict[str, dict] = {}
+    for symbol, outcome, r, created_at in rows:
+        b = by_symbol.setdefault(symbol, {"wins": 0, "losses": 0, "expired": 0, "r_sum": 0.0, "resolved": 0, "r_sequence": []})
+        if outcome == "WIN":
+            b["wins"] += 1
+            b["r_sum"] += r
+            b["resolved"] += 1
+            b["r_sequence"].append(r)
+        elif outcome == "LOSS":
+            b["losses"] += 1
+            b["r_sum"] += r
+            b["resolved"] += 1
+            b["r_sequence"].append(r)
+        else:
+            b["expired"] += 1
+
+    result = []
+    for symbol, b in by_symbol.items():
+        win_rate = b["wins"] / b["resolved"] if b["resolved"] else None
+        avg_r = b["r_sum"] / b["resolved"] if b["resolved"] else None
+
+        gains = sum(r for r in b["r_sequence"] if r > 0)
+        loss_sum = abs(sum(r for r in b["r_sequence"] if r < 0))
+        if loss_sum > 0:
+            profit_factor = gains / loss_sum
+        elif gains > 0:
+            profit_factor = None
+        else:
+            profit_factor = None
+
+        cum, peak, max_dd = 0.0, 0.0, 0.0
+        for r in b["r_sequence"]:
+            cum += r
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
+
+        result.append({
+            "symbol": symbol, "wins": b["wins"], "losses": b["losses"], "expired": b["expired"],
+            "win_rate": win_rate, "avg_r": avg_r, "profit_factor": profit_factor, "max_drawdown_r": max_dd,
+        })
+    return result
+
+
+def get_strategy_type_stats() -> list[dict]:
+    """Same win/loss breakdown, but grouped by which detection engine
+    produced the signal (trend / range / liquidity_sweep / breakout_retest)
+    rather than by symbol -- helps identify which approach is actually
+    pulling its weight."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """SELECT s.strategy_type, o.outcome, o.r_multiple
                FROM signal_outcomes o
                JOIN scalp_signals s ON s.id = o.signal_id"""
         )
@@ -223,9 +293,10 @@ def get_outcome_stats() -> list[dict]:
     finally:
         conn.close()
 
-    by_symbol: dict[str, dict] = {}
-    for symbol, outcome, r in rows:
-        b = by_symbol.setdefault(symbol, {"wins": 0, "losses": 0, "expired": 0, "r_sum": 0.0, "resolved": 0})
+    by_strategy: dict[str, dict] = {}
+    for strategy_type, outcome, r in rows:
+        strategy_type = strategy_type or "trend"
+        b = by_strategy.setdefault(strategy_type, {"wins": 0, "losses": 0, "r_sum": 0.0, "resolved": 0})
         if outcome == "WIN":
             b["wins"] += 1
             b["r_sum"] += r
@@ -234,15 +305,10 @@ def get_outcome_stats() -> list[dict]:
             b["losses"] += 1
             b["r_sum"] += r
             b["resolved"] += 1
-        else:
-            b["expired"] += 1
 
     result = []
-    for symbol, b in by_symbol.items():
+    for strategy_type, b in by_strategy.items():
         win_rate = b["wins"] / b["resolved"] if b["resolved"] else None
         avg_r = b["r_sum"] / b["resolved"] if b["resolved"] else None
-        result.append({
-            "symbol": symbol, "wins": b["wins"], "losses": b["losses"], "expired": b["expired"],
-            "win_rate": win_rate, "avg_r": avg_r,
-        })
+        result.append({"strategy_type": strategy_type, "wins": b["wins"], "losses": b["losses"], "win_rate": win_rate, "avg_r": avg_r})
     return result
