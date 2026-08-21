@@ -125,6 +125,21 @@ def _connect():
         conn.execute("ALTER TABLE backtest_outcomes ADD COLUMN mfe_r REAL")
     except sqlite3.OperationalError:
         pass
+    # Before/after-TP1 split, plus TP2 and timing tracking -- added so we can
+    # distinguish "does the trade reach TP1 easily" from "does it keep
+    # running afterward, and how much does it give back", rather than one
+    # conflated MFE number.
+    for col_def in [
+        "mae_before_tp1_r REAL", "mfe_before_tp1_r REAL",
+        "tp1_hit INTEGER", "tp2_hit INTEGER",
+        "time_to_tp1_minutes REAL", "time_to_tp2_minutes REAL",
+        "mfe_after_tp1_r REAL", "max_giveback_after_tp1_r REAL",
+        "returned_to_entry_after_tp1 INTEGER", "time_to_exit_minutes REAL",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE backtest_outcomes ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
     try:
         conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mae_r REAL")
     except sqlite3.OperationalError:
@@ -385,13 +400,27 @@ def save_evaluation(source: str, symbol: str, strategy_type: str, action: str, c
 
 
 def save_backtest_outcome(evaluation_id: int, outcome: str, exit_price: float, r_multiple: float,
-                           mae_r: float | None = None, mfe_r: float | None = None) -> None:
+                           mae_r: float | None = None, mfe_r: float | None = None,
+                           mae_before_tp1_r: float | None = None, mfe_before_tp1_r: float | None = None,
+                           tp1_hit: bool | None = None, tp2_hit: bool | None = None,
+                           time_to_tp1_minutes: float | None = None, time_to_tp2_minutes: float | None = None,
+                           mfe_after_tp1_r: float | None = None, max_giveback_after_tp1_r: float | None = None,
+                           returned_to_entry_after_tp1: bool | None = None, time_to_exit_minutes: float | None = None) -> None:
     conn = _connect()
     try:
         conn.execute(
-            """INSERT INTO backtest_outcomes (evaluation_id, outcome, exit_price, r_multiple, evaluated_at, mae_r, mfe_r)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (evaluation_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat(), mae_r, mfe_r),
+            """INSERT INTO backtest_outcomes
+               (evaluation_id, outcome, exit_price, r_multiple, evaluated_at, mae_r, mfe_r,
+                mae_before_tp1_r, mfe_before_tp1_r, tp1_hit, tp2_hit,
+                time_to_tp1_minutes, time_to_tp2_minutes, mfe_after_tp1_r, max_giveback_after_tp1_r,
+                returned_to_entry_after_tp1, time_to_exit_minutes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (evaluation_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat(), mae_r, mfe_r,
+             mae_before_tp1_r, mfe_before_tp1_r,
+             int(tp1_hit) if tp1_hit is not None else None, int(tp2_hit) if tp2_hit is not None else None,
+             time_to_tp1_minutes, time_to_tp2_minutes, mfe_after_tp1_r, max_giveback_after_tp1_r,
+             int(returned_to_entry_after_tp1) if returned_to_entry_after_tp1 is not None else None,
+             time_to_exit_minutes),
         )
         conn.commit()
     finally:
