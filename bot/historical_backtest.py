@@ -18,9 +18,14 @@ including NO TRADE ones -- not just the actionable signals -- so we can
 later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
-for outcome-checking, since it's self-contained historical data). Also
-tracks MAE/MFE per trade (Maximum Adverse/Favorable Excursion), computed
-only from price action after entry and only up to the actual exit point.
+for outcome-checking, since it's self-contained historical data).
+
+Tracks MAE/MFE split into before/after TP1: the recorded trade outcome
+(WIN/LOSS/EXPIRED, R-multiple) is fixed at the moment TP1/SL is actually
+hit and NEVER changes based on what happens afterward -- verified by
+explicit test (a hard reversal after a WIN still records the original WIN).
+Everything after TP1 (giveback, TP2 progress, return-to-entry) is clearly
+separate, research-only continued observation, not part of the real outcome.
 
 sl_mult/tp1_mult/tp2_mult let you A/B test different risk:reward ratios
 against identical historical data -- results are tagged distinctly in the
@@ -135,48 +140,104 @@ def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float
     return tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest
 
 
-def find_outcome(df_5m_full: pd.DataFrame, entry_time, entry: float, sl: float, tp1: float, action: str) -> tuple[str, float, float, float, float]:
-    """Same WIN/LOSS/EXPIRED logic as the live backtester, but scanning
-    forward within already-fetched historical 5-minute data instead of
-    making a new API call. Also tracks Maximum Adverse Excursion (MAE) and
-    Maximum Favorable Excursion (MFE), in R-multiples -- how far price moved
-    against/in favor of the position before it closed. Calculated ONLY from
-    price action after entry, and only up to the actual exit point (not
-    beyond it), so it reflects what this specific trade actually
-    experienced, not unrelated later price action.
+def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl: float,
+                           tp1: float, tp2: float | None, action: str) -> dict:
+    """Tracks the ACTUAL trade outcome (unchanged from before -- closes at
+    TP1/SL/expiry, exactly as it always has) but now separates MAE/MFE into
+    two distinct phases:
 
-    Returns (outcome, exit_price, r_multiple, mae_r, mfe_r)."""
+    - mae_before_tp1_r / mfe_before_tp1_r: excursion strictly BEFORE TP1 is
+      touched. Answers "how efficiently/roughly does the trade get there."
+    - mfe_after_tp1_r / max_giveback_after_tp1_r / tp2_hit / returned_to_entry_after_tp1:
+      RESEARCH-ONLY continued observation of what price did AFTER the real
+      exit already happened at TP1. This does NOT change the recorded
+      outcome/r_multiple above -- the trade already closed. It answers a
+      different question: "if we'd held longer, what would have happened,"
+      which is useful for deciding whether TP1 leaves value on the table,
+      but must never be conflated with what was actually captured.
+
+    If TP1 is never reached, all after-TP1 fields are None (not zero) --
+    the question "what happens after TP1" doesn't apply to that trade.
+    """
     window_end = entry_time + timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
-    forward = df_5m_full[(df_5m_full["datetime"] > entry_time) & (df_5m_full["datetime"] <= window_end)]
+    forward = df_5m_full[(df_5m_full["datetime"] > entry_time) & (df_5m_full["datetime"] <= window_end)].reset_index(drop=True)
     risk = abs(entry - sl)
-    max_adverse, max_favorable = 0.0, 0.0
 
-    for _, c in forward.iterrows():
+    max_adverse_before, max_favorable_before = 0.0, 0.0
+    tp1_hit, tp1_hit_time, tp1_row_idx = False, None, None
+    outcome, exit_price, r_multiple = None, None, None
+
+    for i in range(len(forward)):
+        c = forward.iloc[i]
         if action == "LONG":
-            adverse = entry - c["low"]
-            favorable = c["high"] - entry
-            hit_sl, hit_tp1 = c["low"] <= sl, c["high"] >= tp1
+            adverse, favorable = entry - c["low"], c["high"] - entry
+            hit_sl, hit_tp1_now = c["low"] <= sl, c["high"] >= tp1
         else:
-            adverse = c["high"] - entry
-            favorable = entry - c["low"]
-            hit_sl, hit_tp1 = c["high"] >= sl, c["low"] <= tp1
+            adverse, favorable = c["high"] - entry, entry - c["low"]
+            hit_sl, hit_tp1_now = c["high"] >= sl, c["low"] <= tp1
 
-        max_adverse = max(max_adverse, adverse)
-        max_favorable = max(max_favorable, favorable)
-        mae_r = max_adverse / risk if risk else 0.0
-        mfe_r = max_favorable / risk if risk else 0.0
+        if not tp1_hit:
+            max_adverse_before = max(max_adverse_before, adverse)
+            max_favorable_before = max(max_favorable_before, favorable)
 
-        if hit_sl:
-            return "LOSS", sl, -1.0, mae_r, mfe_r
-        if hit_tp1:
-            profit = (tp1 - entry) if action == "LONG" else (entry - tp1)
-            return "WIN", tp1, (profit / risk if risk else 0.0), mae_r, mfe_r
+            if hit_sl:
+                outcome, exit_price, r_multiple = "LOSS", sl, -1.0
+                break
+            if hit_tp1_now:
+                tp1_hit, tp1_hit_time, tp1_row_idx = True, c["datetime"], i
+                profit = (tp1 - entry) if action == "LONG" else (entry - tp1)
+                outcome, exit_price, r_multiple = "WIN", tp1, (profit / risk if risk else 0.0)
+                # deliberately do NOT break -- continue below for research only
 
-    last_close = forward.iloc[-1]["close"] if len(forward) else entry
-    profit = (last_close - entry) if action == "LONG" else (entry - last_close)
-    mae_r = max_adverse / risk if risk else 0.0
-    mfe_r = max_favorable / risk if risk else 0.0
-    return "EXPIRED", last_close, (profit / risk if risk else 0.0), mae_r, mfe_r
+    if outcome is None:
+        last_close = forward.iloc[-1]["close"] if len(forward) else entry
+        profit = (last_close - entry) if action == "LONG" else (entry - last_close)
+        outcome, exit_price, r_multiple = "EXPIRED", last_close, (profit / risk if risk else 0.0)
+
+    result = {
+        "outcome": outcome, "exit_price": exit_price, "r_multiple": r_multiple,
+        "mae_before_tp1_r": max_adverse_before / risk if risk else 0.0,
+        "mfe_before_tp1_r": max_favorable_before / risk if risk else 0.0,
+        "tp1_hit": tp1_hit,
+        "tp2_hit": None, "time_to_tp1_minutes": None, "time_to_tp2_minutes": None,
+        "mfe_after_tp1_r": None, "max_giveback_after_tp1_r": None,
+        "returned_to_entry_after_tp1": None, "time_to_exit_minutes": None,
+    }
+
+    if tp1_hit:
+        result["time_to_tp1_minutes"] = (tp1_hit_time - entry_time).total_seconds() / 60
+
+        peak_favorable_after, tp2_hit, tp2_time, returned_to_entry = 0.0, False, None, False
+        last_time, last_close_after = tp1_hit_time, exit_price
+
+        for j in range(tp1_row_idx, len(forward)):
+            c = forward.iloc[j]
+            if action == "LONG":
+                favorable_now = c["high"] - entry
+                if not tp2_hit and tp2 is not None and c["high"] >= tp2:
+                    tp2_hit, tp2_time = True, c["datetime"]
+                if c["low"] <= entry:
+                    returned_to_entry = True
+            else:
+                favorable_now = entry - c["low"]
+                if not tp2_hit and tp2 is not None and c["low"] <= tp2:
+                    tp2_hit, tp2_time = True, c["datetime"]
+                if c["high"] >= entry:
+                    returned_to_entry = True
+            peak_favorable_after = max(peak_favorable_after, favorable_now)
+            last_time, last_close_after = c["datetime"], c["close"]
+
+        final_favorable = (last_close_after - entry) if action == "LONG" else (entry - last_close_after)
+        giveback_r = max(0.0, (peak_favorable_after - final_favorable) / risk) if risk else 0.0
+
+        result["mfe_after_tp1_r"] = peak_favorable_after / risk if risk else 0.0
+        result["max_giveback_after_tp1_r"] = giveback_r
+        result["tp2_hit"] = tp2_hit
+        result["time_to_tp2_minutes"] = (tp2_time - entry_time).total_seconds() / 60 if tp2_time else None
+        result["returned_to_entry_after_tp1"] = returned_to_entry
+        result["time_to_exit_minutes"] = (last_time - entry_time).total_seconds() / 60
+
+    return result
 
 
 async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
@@ -230,10 +291,18 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
 
         if decision["action"] != "NO TRADE":
             actionable_count += 1
-            outcome, exit_price, r_multiple, mae_r, mfe_r = find_outcome(
-                dfs_full["5m"], t, levels["entry"], levels["sl"], levels["tp1"], decision["action"]
+            detail = find_outcome_detailed(
+                dfs_full["5m"], t, levels["entry"], levels["sl"], levels["tp1"], levels["tp2"], decision["action"]
             )
-            db.save_backtest_outcome(eval_id, outcome, exit_price, r_multiple, mae_r, mfe_r)
+            db.save_backtest_outcome(
+                eval_id, detail["outcome"], detail["exit_price"], detail["r_multiple"],
+                mae_r=detail["mae_before_tp1_r"], mfe_r=detail["mfe_before_tp1_r"],
+                mae_before_tp1_r=detail["mae_before_tp1_r"], mfe_before_tp1_r=detail["mfe_before_tp1_r"],
+                tp1_hit=detail["tp1_hit"], tp2_hit=detail["tp2_hit"],
+                time_to_tp1_minutes=detail["time_to_tp1_minutes"], time_to_tp2_minutes=detail["time_to_tp2_minutes"],
+                mfe_after_tp1_r=detail["mfe_after_tp1_r"], max_giveback_after_tp1_r=detail["max_giveback_after_tp1_r"],
+                returned_to_entry_after_tp1=detail["returned_to_entry_after_tp1"], time_to_exit_minutes=detail["time_to_exit_minutes"],
+            )
 
         t += step
 
