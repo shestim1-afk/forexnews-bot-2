@@ -1,0 +1,41 @@
+name: Confidence Threshold Analysis
+
+# Manual-only. Runs the Phase 1 exploratory analysis against whatever
+# historical backtest data you've already collected (BTC/USD and XAU/USD
+# by default) -- makes no new API calls, just re-analyzes existing data.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  threshold-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run confidence threshold analysis
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m bot.analytics
