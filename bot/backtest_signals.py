@@ -126,23 +126,45 @@ async def run():
         logger.info("No new outcomes finalized this run")
         return
 
+    await telegram_bot.send_text(format_full_stats_message(evaluated_count))
+    logger.info("Sent backtest summary")
+
+
+def format_full_stats_message(newly_evaluated: int | None = None) -> str:
     stats = db.get_outcome_stats()
-    lines = [f"*📊 Backtest Update* ({evaluated_count} newly evaluated)\n"]
+    strategy_stats = db.get_strategy_type_stats()
+
+    if not stats:
+        return "No signals have been evaluated yet. Signals need to be at least 4 hours old before they're checked -- check back once some have had time to play out."
+
+    header = "*📊 Backtest Update*" if newly_evaluated is not None else "*📊 Win/Loss Record So Far*"
+    if newly_evaluated:
+        header += f" ({newly_evaluated} newly evaluated)"
+    lines = [header + "\n"]
+
+    lines.append("_By symbol:_")
     for s in stats:
         if s["win_rate"] is not None:
+            pf = "∞" if s["profit_factor"] is None and s["wins"] > 0 else (f"{s['profit_factor']:.2f}" if s["profit_factor"] is not None else "N/A")
             lines.append(
                 f"*{s['symbol']}*: {s['wins']}W / {s['losses']}L "
-                f"({s['win_rate']*100:.0f}% win rate), avg R: {s['avg_r']:+.2f}"
+                f"({s['win_rate']*100:.0f}% win rate), avg R: {s['avg_r']:+.2f}, "
+                f"profit factor: {pf}, max drawdown: {s['max_drawdown_r']:.2f}R"
                 + (f", {s['expired']} expired" if s["expired"] else "")
             )
         else:
             lines.append(f"*{s['symbol']}*: no resolved signals yet" + (f" ({s['expired']} expired)" if s["expired"] else ""))
 
-    lines.append("")
-    lines.append("_TP1 vs SL, whichever hit first in 15m candles. Small early sample -- treat with appropriate skepticism until more signals accumulate._")
+    if strategy_stats:
+        lines.append("")
+        lines.append("_By strategy type:_")
+        for s in strategy_stats:
+            if s["win_rate"] is not None:
+                lines.append(f"*{s['strategy_type']}*: {s['wins']}W / {s['losses']}L ({s['win_rate']*100:.0f}%), avg R: {s['avg_r']:+.2f}")
 
-    await telegram_bot.send_text("\n".join(lines))
-    logger.info("Sent backtest summary")
+    lines.append("")
+    lines.append("_TP1 vs SL, whichever hit first in 15m candles. Treat with appropriate skepticism until many signals have accumulated._")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
