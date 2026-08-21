@@ -18,7 +18,9 @@ including NO TRADE ones -- not just the actionable signals -- so we can
 later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
-for outcome-checking, since it's self-contained historical data).
+for outcome-checking, since it's self-contained historical data). Also
+tracks MAE/MFE per trade (Maximum Adverse/Favorable Excursion), computed
+only from price action after entry and only up to the actual exit point.
 
 sl_mult/tp1_mult/tp2_mult let you A/B test different risk:reward ratios
 against identical historical data -- results are tagged distinctly in the
@@ -133,28 +135,48 @@ def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float
     return tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest
 
 
-def find_outcome(df_5m_full: pd.DataFrame, entry_time, entry: float, sl: float, tp1: float, action: str) -> tuple[str, float, float]:
+def find_outcome(df_5m_full: pd.DataFrame, entry_time, entry: float, sl: float, tp1: float, action: str) -> tuple[str, float, float, float, float]:
     """Same WIN/LOSS/EXPIRED logic as the live backtester, but scanning
     forward within already-fetched historical 5-minute data instead of
-    making a new API call."""
+    making a new API call. Also tracks Maximum Adverse Excursion (MAE) and
+    Maximum Favorable Excursion (MFE), in R-multiples -- how far price moved
+    against/in favor of the position before it closed. Calculated ONLY from
+    price action after entry, and only up to the actual exit point (not
+    beyond it), so it reflects what this specific trade actually
+    experienced, not unrelated later price action.
+
+    Returns (outcome, exit_price, r_multiple, mae_r, mfe_r)."""
     window_end = entry_time + timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
     forward = df_5m_full[(df_5m_full["datetime"] > entry_time) & (df_5m_full["datetime"] <= window_end)]
     risk = abs(entry - sl)
+    max_adverse, max_favorable = 0.0, 0.0
 
     for _, c in forward.iterrows():
         if action == "LONG":
+            adverse = entry - c["low"]
+            favorable = c["high"] - entry
             hit_sl, hit_tp1 = c["low"] <= sl, c["high"] >= tp1
         else:
+            adverse = c["high"] - entry
+            favorable = entry - c["low"]
             hit_sl, hit_tp1 = c["high"] >= sl, c["low"] <= tp1
+
+        max_adverse = max(max_adverse, adverse)
+        max_favorable = max(max_favorable, favorable)
+        mae_r = max_adverse / risk if risk else 0.0
+        mfe_r = max_favorable / risk if risk else 0.0
+
         if hit_sl:
-            return "LOSS", sl, -1.0
+            return "LOSS", sl, -1.0, mae_r, mfe_r
         if hit_tp1:
             profit = (tp1 - entry) if action == "LONG" else (entry - tp1)
-            return "WIN", tp1, (profit / risk if risk else 0.0)
+            return "WIN", tp1, (profit / risk if risk else 0.0), mae_r, mfe_r
 
     last_close = forward.iloc[-1]["close"] if len(forward) else entry
     profit = (last_close - entry) if action == "LONG" else (entry - last_close)
-    return "EXPIRED", last_close, (profit / risk if risk else 0.0)
+    mae_r = max_adverse / risk if risk else 0.0
+    mfe_r = max_favorable / risk if risk else 0.0
+    return "EXPIRED", last_close, (profit / risk if risk else 0.0), mae_r, mfe_r
 
 
 async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
@@ -208,10 +230,10 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
 
         if decision["action"] != "NO TRADE":
             actionable_count += 1
-            outcome, exit_price, r_multiple = find_outcome(
+            outcome, exit_price, r_multiple, mae_r, mfe_r = find_outcome(
                 dfs_full["5m"], t, levels["entry"], levels["sl"], levels["tp1"], decision["action"]
             )
-            db.save_backtest_outcome(eval_id, outcome, exit_price, r_multiple)
+            db.save_backtest_outcome(eval_id, outcome, exit_price, r_multiple, mae_r, mfe_r)
 
         t += step
 
