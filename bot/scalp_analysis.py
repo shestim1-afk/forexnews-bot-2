@@ -3,14 +3,21 @@ Twelve Data market data and free open-source technical indicators via `ta`.
 
 IMPORTANT, read before trusting this: the confidence score is a heuristic
 composite of how strongly several independent signals agree RIGHT NOW. It is
-NOT a backtested, calibrated probability of a profitable trade. Every signal
-this script generates -- including "NO TRADE" calls -- gets logged to the
-database via db.save_scalp_signal(), specifically so it can be checked
-against what price actually did afterward. Treat this as signal-only data
-collection, especially relevant given leveraged trading amplifies the cost
-of an uncalibrated signal.
+NOT a backtested, calibrated probability of a profitable trade. Every
+actionable signal generated gets logged to the database, tagged with which
+detection engine produced it (trend / range / liquidity_sweep /
+breakout_retest), specifically so it can be checked against what price
+actually did afterward and broken down by approach. Treat this as
+signal-only data collection, especially relevant given leveraged trading
+amplifies the cost of an uncalibrated signal.
 
 This script does NOT place any orders. It only analyzes and reports.
+
+The scheduled hourly-ish digest (run()) only messages Telegram when at
+least one symbol has an actionable signal -- deliberately quiet otherwise,
+rather than a scheduled ping regardless of content. On-demand commands
+(/btc, /gold, /gbpjpy) always show the full diagnostic picture since the
+person explicitly asked for it.
 
 Data source note: an earlier version used Binance directly and hit HTTP 451
 (geo-blocked) from GitHub Actions' shared runners. Twelve Data doesn't have
@@ -26,6 +33,7 @@ import requests
 import pandas as pd
 import ta
 
+from . import config
 from . import db
 from . import telegram_bot
 
@@ -237,6 +245,82 @@ def detect_range_setup(tf_data: dict, dfs: dict, divergence: str | None) -> dict
     return None
 
 
+def detect_liquidity_sweep(df: pd.DataFrame, atr: float, window: int = 3, recent_candles: int = 3,
+                            min_pierce_atr_mult: float = 0.15) -> dict | None:
+    n = len(df)
+    established = df.iloc[:-recent_candles] if n > recent_candles else df
+    highs_e = established["high"].tolist()
+    lows_e = established["low"].tolist()
+    swing_highs, swing_lows = [], []
+    for i in range(window, len(established) - window):
+        if highs_e[i] == max(highs_e[i - window:i + window + 1]):
+            swing_highs.append(highs_e[i])
+        if lows_e[i] == min(lows_e[i - window:i + window + 1]):
+            swing_lows.append(lows_e[i])
+
+    min_pierce = min_pierce_atr_mult * atr
+    recent = df.iloc[-recent_candles:]
+    for _, candle in recent.iterrows():
+        relevant_lows = [l for l in swing_lows if l < candle["open"]]
+        if relevant_lows:
+            nearest_low = max(relevant_lows)
+            pierced = nearest_low - candle["low"]
+            rejected = candle["close"] - nearest_low
+            if pierced >= min_pierce and rejected >= min_pierce:
+                return {"direction": "bullish", "swept_level": nearest_low}
+        relevant_highs = [h for h in swing_highs if h > candle["open"]]
+        if relevant_highs:
+            nearest_high = min(relevant_highs)
+            pierced = candle["high"] - nearest_high
+            rejected = nearest_high - candle["close"]
+            if pierced >= min_pierce and rejected >= min_pierce:
+                return {"direction": "bearish", "swept_level": nearest_high}
+    return None
+
+
+def detect_breakout_retest(df: pd.DataFrame, atr: float, window: int = 3, lookback_recent: int = 20,
+                            breakout_atr_mult: float = 0.3, retest_atr_mult: float = 0.3, min_bars_after: int = 2) -> dict | None:
+    established = df.iloc[:-lookback_recent]
+    recent = df.iloc[-lookback_recent:]
+    highs_e, lows_e = established["high"].tolist(), established["low"].tolist()
+    swing_highs, swing_lows = [], []
+    for i in range(window, len(established) - window):
+        if highs_e[i] == max(highs_e[i - window:i + window + 1]):
+            swing_highs.append(highs_e[i])
+        if lows_e[i] == min(lows_e[i - window:i + window + 1]):
+            swing_lows.append(lows_e[i])
+
+    recent_closes = recent["close"].tolist()
+    recent_lows = recent["low"].tolist()
+    recent_highs = recent["high"].tolist()
+    current_close = recent_closes[-1]
+
+    candidates = [h for h in swing_highs if h < current_close]
+    if candidates:
+        level = max(candidates)
+        breakout_idx = next((i for i, c in enumerate(recent_closes[:-1]) if c > level + breakout_atr_mult * atr), None)
+        if breakout_idx is not None:
+            for j in range(breakout_idx + min_bars_after, len(recent_closes)):
+                ran_higher = max(recent_closes[breakout_idx:j]) > recent_closes[j] + retest_atr_mult * atr * 0.5
+                near_level = abs(recent_lows[j] - level) <= retest_atr_mult * atr
+                held_above = recent_closes[j] > level
+                if ran_higher and near_level and held_above and current_close > recent_closes[j] and current_close > level:
+                    return {"direction": "bullish", "level": level}
+
+    candidates2 = [l for l in swing_lows if l > current_close]
+    if candidates2:
+        level = min(candidates2)
+        breakout_idx = next((i for i, c in enumerate(recent_closes[:-1]) if c < level - breakout_atr_mult * atr), None)
+        if breakout_idx is not None:
+            for j in range(breakout_idx + min_bars_after, len(recent_closes)):
+                ran_lower = min(recent_closes[breakout_idx:j]) < recent_closes[j] - retest_atr_mult * atr * 0.5
+                near_level = abs(recent_highs[j] - level) <= retest_atr_mult * atr
+                held_below = recent_closes[j] < level
+                if ran_lower and near_level and held_below and current_close < recent_closes[j] and current_close < level:
+                    return {"direction": "bearish", "level": level}
+    return None
+
+
 def get_news_bias(keywords: list[str]) -> tuple[str, str]:
     rows = []
     for kw in keywords:
@@ -295,12 +379,28 @@ def score_and_decide(tf_data: dict, news_direction: str) -> dict:
     return {"direction": direction, "action": action, "confidence": confidence}
 
 
-def compute_trade_levels(action: str, entry: float, atr_5m: float) -> dict:
+def compute_trade_levels(action: str, entry: float, atr: float) -> dict:
     if action == "LONG":
-        return {"entry": entry, "sl": entry - 1.5 * atr_5m, "tp1": entry + 1.0 * atr_5m, "tp2": entry + 2.0 * atr_5m}
+        return {"entry": entry, "sl": entry - 1.5 * atr, "tp1": entry + 1.0 * atr, "tp2": entry + 2.0 * atr}
     elif action == "SHORT":
-        return {"entry": entry, "sl": entry + 1.5 * atr_5m, "tp1": entry - 1.0 * atr_5m, "tp2": entry - 2.0 * atr_5m}
+        return {"entry": entry, "sl": entry + 1.5 * atr, "tp1": entry - 1.0 * atr, "tp2": entry - 2.0 * atr}
     return {"entry": None, "sl": None, "tp1": None, "tp2": None}
+
+
+def calculate_position_size(display_symbol: str, entry: float | None, sl: float | None) -> str | None:
+    if entry is None or sl is None or entry == sl:
+        return None
+    risk_amount = config.ACCOUNT_SIZE_USD * (config.RISK_PCT_PER_TRADE / 100)
+    price_risk_per_unit = abs(entry - sl)
+    units = risk_amount / price_risk_per_unit
+
+    if "BTC" in display_symbol:
+        return f"{units:.4f} BTC (risking ${risk_amount:.2f})"
+    elif "Gold" in display_symbol or "XAU" in display_symbol:
+        return f"{units:.2f} oz (risking ${risk_amount:.2f})"
+    else:
+        lots = units / 100000
+        return f"{units:.0f} units (~{lots:.4f} std lots) -- approx, verify with your broker (risking ${risk_amount:.2f})"
 
 
 LABEL_EMOJI = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
@@ -308,7 +408,7 @@ LABEL_EMOJI = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
 
 def format_symbol_block(display_symbol: str, tf_data: dict, decision: dict, levels: dict,
                          news_direction: str, news_summary: str, range_setup: dict | None,
-                         divergence: str | None) -> str:
+                         divergence: str | None, sweep: dict | None, breakout_retest: dict | None) -> str:
     lines = [f"*{display_symbol}*"]
     for tf_label in ["4h", "1h", "15m", "5m"]:
         d = tf_data[tf_label]
@@ -333,18 +433,54 @@ def format_symbol_block(display_symbol: str, tf_data: dict, decision: dict, leve
     lines.append(f"{action_emoji} Trend: *{decision['action']}*" + (f" ({decision['confidence']}%)" if decision["action"] != "NO TRADE" else ""))
     if decision["action"] != "NO TRADE":
         lines.append(f"  Entry {levels['entry']:.5f} | SL {levels['sl']:.5f} | TP1 {levels['tp1']:.5f} | TP2 {levels['tp2']:.5f}")
+        size = calculate_position_size(display_symbol, levels["entry"], levels["sl"])
+        if size:
+            lines.append(f"  Size: {size}")
 
     if range_setup:
         rs_emoji = "🟢" if range_setup["direction"] == "LONG" else "🔴"
         lines.append(f"{rs_emoji} Range: *{range_setup['direction']}* -- {range_setup['reason']}")
         lines.append(f"  Entry {range_setup['entry']:.5f} | SL {range_setup['sl']:.5f} | TP {range_setup['tp']:.5f}")
+        size = calculate_position_size(display_symbol, range_setup["entry"], range_setup["sl"])
+        if size:
+            lines.append(f"  Size: {size}")
     elif tf_data["1h"]["adx"] < 20:
         lines.append("⚪ Range: 1H ranging, no trigger nearby yet")
+
+    if sweep:
+        sw_emoji = "🟢" if sweep["direction"] == "bullish" else "🔴"
+        action_word = "LONG" if sweep["direction"] == "bullish" else "SHORT"
+        lines.append(f"{sw_emoji} Liquidity sweep: *{action_word}* -- swept {sweep['swept_level']:.5f} and rejected")
+        entry = tf_data["15m"]["close"]
+        atr15 = tf_data["15m"]["atr"]
+        sl = sweep["swept_level"] - 0.3 * atr15 if sweep["direction"] == "bullish" else sweep["swept_level"] + 0.3 * atr15
+        tp1 = entry + 1.5 * atr15 if sweep["direction"] == "bullish" else entry - 1.5 * atr15
+        lines.append(f"  Entry {entry:.5f} | SL {sl:.5f} | TP1 {tp1:.5f}")
+        size = calculate_position_size(display_symbol, entry, sl)
+        if size:
+            lines.append(f"  Size: {size}")
+
+    if breakout_retest:
+        br_emoji = "🟢" if breakout_retest["direction"] == "bullish" else "🔴"
+        action_word = "LONG" if breakout_retest["direction"] == "bullish" else "SHORT"
+        lines.append(f"{br_emoji} Breakout+retest: *{action_word}* -- level {breakout_retest['level']:.5f} held on retest")
+        entry = tf_data["15m"]["close"]
+        atr15 = tf_data["15m"]["atr"]
+        sl = breakout_retest["level"] - 0.3 * atr15 if breakout_retest["direction"] == "bullish" else breakout_retest["level"] + 0.3 * atr15
+        tp1 = entry + 1.5 * atr15 if breakout_retest["direction"] == "bullish" else entry - 1.5 * atr15
+        lines.append(f"  Entry {entry:.5f} | SL {sl:.5f} | TP1 {tp1:.5f}")
+        size = calculate_position_size(display_symbol, entry, sl)
+        if size:
+            lines.append(f"  Size: {size}")
 
     return "\n".join(lines)
 
 
-def analyze_symbol(symbol_cfg: dict) -> tuple[str, dict, dict | None]:
+def is_actionable(decision: dict, range_setup: dict | None, sweep: dict | None, breakout_retest: dict | None) -> bool:
+    return decision["action"] != "NO TRADE" or range_setup is not None or sweep is not None or breakout_retest is not None
+
+
+def analyze_symbol(symbol_cfg: dict) -> tuple[str, list[dict], bool]:
     api_symbol = symbol_cfg["api"]
     display = symbol_cfg["display"]
 
@@ -353,51 +489,92 @@ def analyze_symbol(symbol_cfg: dict) -> tuple[str, dict, dict | None]:
         df = fetch_klines(api_symbol, interval)
         if df is None or len(df) < 205:
             logger.warning("Insufficient data for %s %s", display, label)
-            return f"*{display}*\n⚠️ Could not fetch enough price data this cycle.", None, None
+            return f"*{display}*\n⚠️ Could not fetch enough price data this cycle.", [], False
         tf_data[label] = compute_indicators(df)
         dfs[label] = df
         if i < len(TIMEFRAMES) - 1:
             time.sleep(REQUEST_DELAY_SECONDS)
 
     divergence = detect_rsi_divergence(dfs["15m"])
-
     news_direction, news_summary = get_news_bias(symbol_cfg["news_keywords"])
     decision = score_and_decide(tf_data, news_direction)
     range_setup = detect_range_setup(tf_data, dfs, divergence)
+    sweep = detect_liquidity_sweep(dfs["15m"], tf_data["15m"]["atr"])
+    breakout_retest = detect_breakout_retest(dfs["15m"], tf_data["15m"]["atr"])
 
     entry_price = tf_data["5m"]["close"]
     atr_5m = tf_data["5m"]["atr"]
     levels = compute_trade_levels(decision["action"], entry_price, atr_5m)
 
-    block = format_symbol_block(display, tf_data, decision, levels, news_direction, news_summary, range_setup, divergence)
+    block = format_symbol_block(display, tf_data, decision, levels, news_direction, news_summary,
+                                 range_setup, divergence, sweep, breakout_retest)
 
-    signal_data = {
-        "symbol": display, "action": decision["action"], "entry": levels["entry"],
-        "sl": levels["sl"], "tp1": levels["tp1"], "tp2": levels["tp2"], "confidence": decision["confidence"],
-        "details": f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']} news={news_direction} divergence={divergence}"
-                   + (f" | range={range_setup['direction']}@{range_setup['entry']:.5f}" if range_setup else ""),
-    }
-    return block, signal_data, range_setup
+    actionable_signals = []
+    if decision["action"] != "NO TRADE":
+        actionable_signals.append({
+            "symbol": display, "action": decision["action"], "entry": levels["entry"], "sl": levels["sl"],
+            "tp1": levels["tp1"], "tp2": levels["tp2"], "confidence": decision["confidence"],
+            "details": f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']} news={news_direction} divergence={divergence}",
+            "strategy_type": "trend",
+        })
+    if range_setup:
+        actionable_signals.append({
+            "symbol": display, "action": range_setup["direction"],
+            "entry": range_setup["entry"], "sl": range_setup["sl"], "tp1": range_setup["tp"], "tp2": None,
+            "confidence": 60, "details": range_setup["reason"], "strategy_type": "range",
+        })
+    if sweep:
+        atr15 = tf_data["15m"]["atr"]
+        entry = tf_data["15m"]["close"]
+        sl = sweep["swept_level"] - 0.3 * atr15 if sweep["direction"] == "bullish" else sweep["swept_level"] + 0.3 * atr15
+        tp1 = entry + 1.5 * atr15 if sweep["direction"] == "bullish" else entry - 1.5 * atr15
+        actionable_signals.append({
+            "symbol": display, "action": "LONG" if sweep["direction"] == "bullish" else "SHORT",
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None, "confidence": 60,
+            "details": f"swept {sweep['swept_level']:.5f}", "strategy_type": "liquidity_sweep",
+        })
+    if breakout_retest:
+        atr15 = tf_data["15m"]["atr"]
+        entry = tf_data["15m"]["close"]
+        sl = breakout_retest["level"] - 0.3 * atr15 if breakout_retest["direction"] == "bullish" else breakout_retest["level"] + 0.3 * atr15
+        tp1 = entry + 1.5 * atr15 if breakout_retest["direction"] == "bullish" else entry - 1.5 * atr15
+        actionable_signals.append({
+            "symbol": display, "action": "LONG" if breakout_retest["direction"] == "bullish" else "SHORT",
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None, "confidence": 60,
+            "details": f"retested {breakout_retest['level']:.5f}", "strategy_type": "breakout_retest",
+        })
+
+    actionable = is_actionable(decision, range_setup, sweep, breakout_retest)
+    return block, actionable_signals, actionable
 
 
 async def run():
-    """Hourly digest: analyzes all tracked symbols and sends one consolidated message."""
+    """Scheduled scan: analyzes all tracked symbols, but only messages
+    Telegram if at least one symbol has an actionable signal -- silent
+    otherwise, rather than a scheduled digest regardless of content."""
     blocks = []
     for i, symbol_cfg in enumerate(SYMBOLS):
-        block, signal_data, _ = analyze_symbol(symbol_cfg)
-        blocks.append(block)
-        if signal_data:
+        block, actionable_signals, actionable = analyze_symbol(symbol_cfg)
+        for sig in actionable_signals:
             db.save_scalp_signal(
-                symbol=signal_data["symbol"], action=signal_data["action"],
-                entry=signal_data["entry"], sl=signal_data["sl"], tp1=signal_data["tp1"], tp2=signal_data["tp2"],
-                confidence=signal_data["confidence"], details=signal_data["details"],
+                symbol=sig["symbol"], action=sig["action"], entry=sig["entry"], sl=sig["sl"],
+                tp1=sig["tp1"], tp2=sig["tp2"], confidence=sig["confidence"], details=sig["details"],
+                strategy_type=sig["strategy_type"],
             )
+        if actionable:
+            blocks.append(block)
+        else:
+            logger.info("%s: nothing actionable this cycle", symbol_cfg["display"])
         if i < len(SYMBOLS) - 1:
             time.sleep(REQUEST_DELAY_SECONDS)
 
-    message = "*📡 Hourly Scalp Scan*\n\n" + "\n\n".join(blocks) + "\n\n_Heuristic score, not backtested -- signal-only, not financial advice._"
+    if not blocks:
+        logger.info("No actionable signals across any symbol -- staying quiet this cycle")
+        return
+
+    message = "*📡 Scalp Alert*\n\n" + "\n\n".join(blocks) + "\n\n_Heuristic score, not backtested -- signal-only, not financial advice._"
     await telegram_bot.send_text(message)
-    logger.info("Sent hourly digest covering %d symbols", len(SYMBOLS))
+    logger.info("Sent alert covering %d actionable symbol(s)", len(blocks))
 
 
 if __name__ == "__main__":
