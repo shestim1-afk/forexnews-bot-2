@@ -87,6 +87,36 @@ def _connect():
         conn.execute("ALTER TABLE scalp_signals ADD COLUMN strategy_type TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists from a previous run
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS all_evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            symbol TEXT,
+            strategy_type TEXT,
+            action TEXT,
+            confidence REAL,
+            entry REAL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            details TEXT,
+            evaluated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS backtest_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            evaluation_id INTEGER,
+            outcome TEXT,
+            exit_price REAL,
+            r_multiple REAL,
+            evaluated_at TEXT
+        )
+        """
+    )
     return conn
 
 
@@ -312,3 +342,89 @@ def get_strategy_type_stats() -> list[dict]:
         avg_r = b["r_sum"] / b["resolved"] if b["resolved"] else None
         result.append({"strategy_type": strategy_type, "wins": b["wins"], "losses": b["losses"], "win_rate": win_rate, "avg_r": avg_r})
     return result
+
+
+def save_evaluation(source: str, symbol: str, strategy_type: str, action: str, confidence: float,
+                     entry: float | None, sl: float | None, tp1: float | None, tp2: float | None,
+                     details: str, evaluated_at: str | None = None) -> int:
+    """Logs EVERY evaluated setup -- including NO TRADE / no-signal ones --
+    not just the ones that got sent. source is 'live' (the real running bot)
+    or 'backtest' (a historical replay). This is what lets us later ask
+    "is our filtering actually improving quality, or throwing away good
+    setups along with bad ones?" -- a question we can't answer if we only
+    keep the setups we acted on. Returns the new row's id."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """INSERT INTO all_evaluations (source, symbol, strategy_type, action, confidence, entry, sl, tp1, tp2, details, evaluated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (source, symbol, strategy_type, action, confidence, entry, sl, tp1, tp2, details,
+             evaluated_at or datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def save_backtest_outcome(evaluation_id: int, outcome: str, exit_price: float, r_multiple: float) -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            """INSERT INTO backtest_outcomes (evaluation_id, outcome, exit_price, r_multiple, evaluated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (evaluation_id, outcome, exit_price, r_multiple, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_backtest_summary(symbol: str) -> dict:
+    """Aggregate results for a completed historical backtest run: how many
+    setups were evaluated in total (including NO TRADE), how many were
+    actionable, and win/loss/profit-factor/drawdown among the actionable
+    ones that reached an outcome."""
+    conn = _connect()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM all_evaluations WHERE source='backtest' AND symbol=?", (symbol,)
+        ).fetchone()[0]
+        no_trade = conn.execute(
+            "SELECT COUNT(*) FROM all_evaluations WHERE source='backtest' AND symbol=? AND action='NO TRADE'",
+            (symbol,),
+        ).fetchone()[0]
+        rows = conn.execute(
+            """SELECT o.outcome, o.r_multiple
+               FROM backtest_outcomes o
+               JOIN all_evaluations e ON e.id = o.evaluation_id
+               WHERE e.symbol = ?
+               ORDER BY o.evaluated_at ASC""",
+            (symbol,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    wins = sum(1 for outcome, r in rows if outcome == "WIN")
+    losses = sum(1 for outcome, r in rows if outcome == "LOSS")
+    expired = sum(1 for outcome, r in rows if outcome == "EXPIRED")
+    resolved = wins + losses
+    r_sequence = [r for outcome, r in rows if outcome in ("WIN", "LOSS")]
+
+    win_rate = wins / resolved if resolved else None
+    avg_r = sum(r_sequence) / resolved if resolved else None
+    gains = sum(r for r in r_sequence if r > 0)
+    loss_sum = abs(sum(r for r in r_sequence if r < 0))
+    profit_factor = gains / loss_sum if loss_sum > 0 else None
+
+    cum, peak, max_dd = 0.0, 0.0, 0.0
+    for r in r_sequence:
+        cum += r
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+
+    return {
+        "symbol": symbol, "total_evaluated": total, "no_trade_count": no_trade,
+        "actionable_count": total - no_trade, "wins": wins, "losses": losses, "expired": expired,
+        "win_rate": win_rate, "avg_r": avg_r, "profit_factor": profit_factor, "max_drawdown_r": max_dd,
+    }
