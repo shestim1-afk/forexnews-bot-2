@@ -16,12 +16,30 @@ FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")
 
 # --- Tuning ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
-MIN_CONFIDENCE_TO_ALERT = float(os.getenv("MIN_CONFIDENCE_TO_ALERT", "0.70"))
+MIN_CONFIDENCE_TO_ALERT = float(os.getenv("MIN_CONFIDENCE_TO_ALERT", "0.7"))
 MAX_ITEMS_PER_CYCLE = int(os.getenv("MAX_ITEMS_PER_CYCLE", "25"))
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 # Delay between AI classification calls, to stay under free-tier rate limits
 # (e.g. Gemini free tier allows only ~10-15 requests/minute).
 CLASSIFY_DELAY_SECONDS = float(os.getenv("CLASSIFY_DELAY_SECONDS", "4.5"))
+
+# --- Position sizing (used by the scalp bot's risk engine) ---
+# These are placeholders -- personalize to your actual account before
+# trusting the position sizes shown in any signal.
+ACCOUNT_SIZE_USD = float(os.getenv("ACCOUNT_SIZE_USD", "1000"))
+RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.0"))
+
+# --- Daily risk controller (paper-trading simulation) ---
+# These mirror the standard risk-management guardrails: a hard ceiling on
+# how much of the account can be at risk in a single day, a break after too
+# many losses in a row, and a cap on how many trades get taken per day --
+# regardless of how many signals the bot generates. None of this executes
+# real trades; it simulates what WOULD happen if these signals were traded
+# with this risk framework, so the numbers are trustworthy before ever
+# connecting this to a real account.
+MAX_DAILY_RISK_PCT = float(os.getenv("MAX_DAILY_RISK_PCT", str(RISK_PCT_PER_TRADE * 3)))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "seen.sqlite3")
 
@@ -66,6 +84,12 @@ RSS_FEEDS = {
 # trumpstruth.org is a free, actively-maintained public archive with a real
 # RSS feed -- far more reliable than Nitter for this specific account.
 TRUTH_SOCIAL_RSS = "https://www.trumpstruth.org/feed"
+
+# --- Forex Factory economic calendar (free, official public feed) ---
+# Forex Factory itself publishes this JSON feed for third-party tools (the
+# same one countless MetaTrader news indicators use) -- no login, no
+# scraping. Community-documented rate limit is ~2 requests/5min; this bot
+# makes 1 request per 5-minute cycle, well within that.
 FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # --- Notable X/Twitter accounts to track via free Nitter/RSS-Bridge sources
@@ -109,9 +133,3 @@ ASSET_UNIVERSE = {
         "Individual stock (name it)", "US indices (S&P500/Nasdaq/Dow)",
     ],
 }
-
-# --- Position sizing (used by the scalp bot's risk engine) ---
-# These are placeholders -- personalize to your actual account before
-# trusting the position sizes shown in any signal.
-ACCOUNT_SIZE_USD = float(os.getenv("ACCOUNT_SIZE_USD", "1000"))
-RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.0"))
