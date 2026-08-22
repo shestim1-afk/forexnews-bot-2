@@ -19,18 +19,6 @@ later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
 for outcome-checking, since it's self-contained historical data).
-
-Tracks MAE/MFE split into before/after TP1: the recorded trade outcome
-(WIN/LOSS/EXPIRED, R-multiple) is fixed at the moment TP1/SL is actually
-hit and NEVER changes based on what happens afterward -- verified by
-explicit test (a hard reversal after a WIN still records the original WIN).
-Everything after TP1 (giveback, TP2 progress, return-to-entry) is clearly
-separate, research-only continued observation, not part of the real outcome.
-
-sl_mult/tp1_mult/tp2_mult let you A/B test different risk:reward ratios
-against identical historical data -- results are tagged distinctly in the
-database so a variant run never mixes with the baseline numbers for the
-same symbol.
 """
 
 import asyncio
@@ -242,8 +230,14 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
 
 async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
               sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0):
+    # Tag variant runs distinctly so they never mix with the baseline
+    # results already in the database for this symbol
     is_variant = (sl_mult, tp1_mult, tp2_mult) != (1.5, 1.0, 2.0)
     result_symbol = f"{display_symbol} (R:R {tp1_mult:.1f}:{sl_mult:.1f})" if is_variant else display_symbol
+
+    cleared = db.clear_backtest_data(result_symbol)
+    if cleared:
+        logger.info("Cleared %d prior evaluation(s) for %s before starting this fresh run", cleared, result_symbol)
 
     logger.info("Fetching historical data for %s...", display_symbol)
     dfs_full = {}
@@ -255,10 +249,12 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
         dfs_full[label] = df
         logger.info("%s: %d candles, from %s to %s", label, len(df), df["datetime"].min(), df["datetime"].max())
 
+    # Bound the replay window to whatever timeframe has the least history
+    # (in practice, 5-minute data, given the free-tier candle-count cap)
     earliest_start = max(df["datetime"].min() for df in dfs_full.values())
     latest_end = min(df["datetime"].max() for df in dfs_full.values())
-    replay_start = earliest_start + timedelta(minutes=WARMUP_BARS * 5)
-    replay_end = latest_end - timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
+    replay_start = earliest_start + timedelta(minutes=WARMUP_BARS * 5)  # ensure warmup for the finest timeframe
+    replay_end = latest_end - timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)  # leave room to check outcomes
 
     if replay_start >= replay_end:
         logger.error("Not enough historical range to replay after accounting for warmup and outcome lookahead")
