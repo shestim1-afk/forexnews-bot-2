@@ -19,6 +19,11 @@ later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
 for outcome-checking, since it's self-contained historical data).
+
+A persistent multi-hour trend is tracked as ONE open trade, not counted
+again every 30-min replay step -- otherwise a single 4-hour trend would
+inflate the actionable count 8x over. A new same-direction signal only
+counts as fresh once the prior one has actually reached its own exit time.
 """
 
 import asyncio
@@ -267,6 +272,13 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
     t = replay_start
     evaluated_count = 0
     actionable_count = 0
+    continuation_count = 0
+    # Tracks the currently "open" trade, if any: same-direction signals that
+    # appear again before this trade's own exit time has passed are the SAME
+    # ongoing opportunity, not fresh independent trades -- without this, a
+    # single 4-hour trend shows up as 8 separate "wins" in a 30-min replay.
+    open_direction = None
+    open_exit_time = None
 
     while t <= replay_end:
         result = evaluate_at(t, dfs_full, sl_mult, tp1_mult, tp2_mult)
@@ -276,6 +288,21 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
 
         tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest = result
 
+        if decision["action"] == "NO TRADE":
+            open_direction, open_exit_time = None, None
+            t += step
+            continue
+
+        is_continuation = (
+            open_direction == decision["action"]
+            and open_exit_time is not None
+            and t <= open_exit_time
+        )
+        if is_continuation:
+            continuation_count += 1
+            t += step
+            continue
+
         eval_id = db.save_evaluation(
             source="backtest", symbol=result_symbol, strategy_type="trend", action=decision["action"],
             confidence=decision["confidence"], entry=levels["entry"], sl=levels["sl"],
@@ -284,25 +311,33 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             evaluated_at=t.isoformat(),
         )
         evaluated_count += 1
+        actionable_count += 1
 
-        if decision["action"] != "NO TRADE":
-            actionable_count += 1
-            detail = find_outcome_detailed(
-                dfs_full["5m"], t, levels["entry"], levels["sl"], levels["tp1"], levels["tp2"], decision["action"]
-            )
-            db.save_backtest_outcome(
-                eval_id, detail["outcome"], detail["exit_price"], detail["r_multiple"],
-                mae_r=detail["mae_before_tp1_r"], mfe_r=detail["mfe_before_tp1_r"],
-                mae_before_tp1_r=detail["mae_before_tp1_r"], mfe_before_tp1_r=detail["mfe_before_tp1_r"],
-                tp1_hit=detail["tp1_hit"], tp2_hit=detail["tp2_hit"],
-                time_to_tp1_minutes=detail["time_to_tp1_minutes"], time_to_tp2_minutes=detail["time_to_tp2_minutes"],
-                mfe_after_tp1_r=detail["mfe_after_tp1_r"], max_giveback_after_tp1_r=detail["max_giveback_after_tp1_r"],
-                returned_to_entry_after_tp1=detail["returned_to_entry_after_tp1"], time_to_exit_minutes=detail["time_to_exit_minutes"],
-            )
+        detail = find_outcome_detailed(
+            dfs_full["5m"], t, levels["entry"], levels["sl"], levels["tp1"], levels["tp2"], decision["action"]
+        )
+        db.save_backtest_outcome(
+            eval_id, detail["outcome"], detail["exit_price"], detail["r_multiple"],
+            mae_r=detail["mae_before_tp1_r"], mfe_r=detail["mfe_before_tp1_r"],
+            mae_before_tp1_r=detail["mae_before_tp1_r"], mfe_before_tp1_r=detail["mfe_before_tp1_r"],
+            tp1_hit=detail["tp1_hit"], tp2_hit=detail["tp2_hit"],
+            time_to_tp1_minutes=detail["time_to_tp1_minutes"], time_to_tp2_minutes=detail["time_to_tp2_minutes"],
+            mfe_after_tp1_r=detail["mfe_after_tp1_r"], max_giveback_after_tp1_r=detail["max_giveback_after_tp1_r"],
+            returned_to_entry_after_tp1=detail["returned_to_entry_after_tp1"], time_to_exit_minutes=detail["time_to_exit_minutes"],
+        )
+
+        # Mark this trade as "open" until its own exit time -- any
+        # same-direction signal appearing before then is a continuation,
+        # not a fresh independent trade
+        open_direction = decision["action"]
+        if detail["time_to_exit_minutes"] is not None:
+            open_exit_time = t + timedelta(minutes=detail["time_to_exit_minutes"])
+        else:
+            open_exit_time = t + timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
 
         t += step
 
-    logger.info("Backtest complete: %d evaluated, %d actionable", evaluated_count, actionable_count)
+    logger.info("Backtest complete: %d evaluated, %d actionable, %d continuations skipped", evaluated_count, actionable_count, continuation_count)
 
     summary = db.get_backtest_summary(result_symbol)
     lines = [f"*📈 Historical Backtest: {result_symbol}*\n"]
