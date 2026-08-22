@@ -601,7 +601,7 @@ async def run():
     otherwise, rather than a scheduled digest regardless of content."""
     blocks = []
     for i, symbol_cfg in enumerate(SYMBOLS):
-                block, actionable_signals, actionable = analyze_symbol(symbol_cfg)
+        block, actionable_signals, actionable = analyze_symbol(symbol_cfg)
         risk_lines = []
         for sig in actionable_signals:
             open_signal = db.get_open_signal(sig["symbol"], sig["strategy_type"])
