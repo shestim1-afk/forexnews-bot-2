@@ -87,6 +87,10 @@ def _connect():
         conn.execute("ALTER TABLE scalp_signals ADD COLUMN strategy_type TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists from a previous run
+    try:
+        conn.execute("ALTER TABLE scalp_signals ADD COLUMN risk_allowed INTEGER")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS all_evaluations (
@@ -148,6 +152,20 @@ def _connect():
         conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mfe_r REAL")
     except sqlite3.OperationalError:
         pass
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_risk_state (
+            date TEXT PRIMARY KEY,
+            trades_taken INTEGER DEFAULT 0,
+            consecutive_losses INTEGER DEFAULT 0,
+            cumulative_r REAL DEFAULT 0.0,
+            cumulative_usd REAL DEFAULT 0.0,
+            reserved_risk_usd REAL DEFAULT 0.0,
+            kill_switch_triggered INTEGER DEFAULT 0,
+            kill_switch_reason TEXT
+        )
+        """
+    )
     return conn
 
 
@@ -221,19 +239,24 @@ def get_recent_classifications(asset_keyword: str, hours: int = 2) -> list[dict]
 
 def save_scalp_signal(symbol: str, action: str, entry: float | None, sl: float | None,
                        tp1: float | None, tp2: float | None, confidence: float, details: str,
-                       strategy_type: str = "trend") -> None:
+                       strategy_type: str = "trend", risk_allowed: bool | None = None) -> None:
     """Logs every scalp signal generated (including NO TRADE calls) with a
     timestamp, so that once enough signals accumulate, we can go back and
     check what price actually did afterward -- the only way to find out if
     the confidence score means anything real. strategy_type tags which
     engine produced it (trend / range / liquidity_sweep / breakout_retest)
-    so performance can be broken down by approach, not just by symbol."""
+    so performance can be broken down by approach, not just by symbol.
+    risk_allowed records whether the daily risk controller would have
+    actually taken this trade at generation time -- only allowed signals
+    should count against the day's simulated P&L when their outcome
+    resolves later."""
     conn = _connect()
     try:
         conn.execute(
-            """INSERT INTO scalp_signals (symbol, action, entry, sl, tp1, tp2, confidence, details, created_at, strategy_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (symbol, action, entry, sl, tp1, tp2, confidence, details, datetime.now(timezone.utc).isoformat(), strategy_type),
+            """INSERT INTO scalp_signals (symbol, action, entry, sl, tp1, tp2, confidence, details, created_at, strategy_type, risk_allowed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (symbol, action, entry, sl, tp1, tp2, confidence, details, datetime.now(timezone.utc).isoformat(), strategy_type,
+             int(risk_allowed) if risk_allowed is not None else None),
         )
         conn.commit()
     finally:
@@ -249,7 +272,7 @@ def get_unevaluated_signals(min_age_hours: int = 4, max_age_hours: int = 48) -> 
         cutoff_min = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
         cutoff_max = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
         cur = conn.execute(
-            """SELECT id, symbol, action, entry, sl, tp1, tp2, confidence, created_at
+            """SELECT id, symbol, action, entry, sl, tp1, tp2, confidence, created_at, risk_allowed
                FROM scalp_signals
                WHERE action != 'NO TRADE'
                  AND created_at <= ?
@@ -259,7 +282,7 @@ def get_unevaluated_signals(min_age_hours: int = 4, max_age_hours: int = 48) -> 
                LIMIT 30""",
             (cutoff_min, cutoff_max),
         )
-        cols = ["id", "symbol", "action", "entry", "sl", "tp1", "tp2", "confidence", "created_at"]
+        cols = ["id", "symbol", "action", "entry", "sl", "tp1", "tp2", "confidence", "created_at", "risk_allowed"]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
     finally:
         conn.close()
@@ -322,7 +345,7 @@ def get_outcome_stats() -> list[dict]:
         if loss_sum > 0:
             profit_factor = gains / loss_sum
         elif gains > 0:
-            profit_factor = None
+            profit_factor = None  # no losses yet to divide by -- can't compute meaningfully
         else:
             profit_factor = None
 
@@ -357,7 +380,7 @@ def get_strategy_type_stats() -> list[dict]:
 
     by_strategy: dict[str, dict] = {}
     for strategy_type, outcome, r in rows:
-        strategy_type = strategy_type or "trend"
+        strategy_type = strategy_type or "trend"  # older rows predate this column
         b = by_strategy.setdefault(strategy_type, {"wins": 0, "losses": 0, "r_sum": 0.0, "resolved": 0})
         if outcome == "WIN":
             b["wins"] += 1
@@ -475,3 +498,27 @@ def get_backtest_summary(symbol: str) -> dict:
         "actionable_count": total - no_trade, "wins": wins, "losses": losses, "expired": expired,
         "win_rate": win_rate, "avg_r": avg_r, "profit_factor": profit_factor, "max_drawdown_r": max_dd,
     }
+
+
+def clear_backtest_data(symbol: str) -> int:
+    """Deletes all existing backtest evaluations/outcomes for this exact
+    symbol tag before a fresh historical backtest run starts. Without this,
+    re-running the backtest (even accidentally, e.g. double-clicking) adds
+    a second overlapping window on top of the first -- since each run
+    covers roughly the same ~17-day free-tier history, the two runs mostly
+    cover the SAME market days, silently double-counting them rather than
+    adding genuinely new information. Returns the number of evaluation
+    rows deleted."""
+    conn = _connect()
+    try:
+        eval_ids = [row[0] for row in conn.execute(
+            "SELECT id FROM all_evaluations WHERE source='backtest' AND symbol=?", (symbol,)
+        ).fetchall()]
+        if eval_ids:
+            placeholders = ",".join("?" * len(eval_ids))
+            conn.execute(f"DELETE FROM backtest_outcomes WHERE evaluation_id IN ({placeholders})", eval_ids)
+            conn.execute(f"DELETE FROM all_evaluations WHERE id IN ({placeholders})", eval_ids)
+            conn.commit()
+        return len(eval_ids)
+    finally:
+        conn.close()
