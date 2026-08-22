@@ -19,14 +19,11 @@ later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
 for outcome-checking, since it's self-contained historical data).
-
-A persistent multi-hour trend is tracked as ONE open trade using its ACTUAL
-exit time (SL hit time for a loss, TP1 hit time for a win, window-end for
-expired) -- not counted again every 30-min replay step.
 """
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -92,6 +89,70 @@ def slice_up_to(df: pd.DataFrame, cutoff_dt, window: int = WARMUP_BARS) -> pd.Da
     return sliced.iloc[-window:].reset_index(drop=True)
 
 
+def fetch_paginated_history(api_symbol: str, interval: str, target_start: datetime, target_end: datetime,
+                             chunk_size: int = 5000, request_delay: float = 8.0) -> pd.DataFrame | None:
+    """Fetches a potentially long historical range by paginating backward
+    in chunk_size-candle requests, working around the free tier's
+    per-request cap. Stops early and returns whatever was collected if the
+    API runs out of data before reaching target_start -- Twelve Data's own
+    docs say intraday forex/crypto history can go back up to a year, but
+    that isn't confirmed for every symbol/interval on the free tier
+    specifically, so this discovers the REAL depth limit empirically
+    rather than assuming it. request_delay paces calls to stay under the
+    free tier's 8 requests/minute limit."""
+    if not scalp_analysis.TWELVEDATA_API_KEY:
+        return None
+    all_chunks = []
+    current_end = target_end
+    max_iterations = 40  # safety cap -- comfortably more than a full year needs at any interval here
+
+    for _ in range(max_iterations):
+        if current_end <= target_start:
+            break
+        try:
+            r = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={
+                    "symbol": api_symbol, "interval": interval, "outputsize": chunk_size,
+                    "end_date": current_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    "apikey": scalp_analysis.TWELVEDATA_API_KEY,
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            logger.warning("Failed to fetch chunk for %s %s ending %s: %s", api_symbol, interval, current_end, e)
+            break
+
+        if data.get("status") == "error" or "values" not in data or not data["values"]:
+            logger.info(
+                "No more data available for %s %s before %s -- likely the real historical depth limit for this symbol/plan",
+                api_symbol, interval, current_end,
+            )
+            break
+
+        values = data["values"]
+        values.reverse()
+        chunk = pd.DataFrame(values)
+        chunk["datetime"] = pd.to_datetime(chunk["datetime"])
+        for col in ["open", "high", "low", "close"]:
+            chunk[col] = chunk[col].astype(float)
+        chunk["volume"] = chunk["volume"].astype(float) if "volume" in chunk.columns else 0.0
+        all_chunks.append(chunk)
+
+        earliest = chunk["datetime"].min()
+        if earliest >= current_end:
+            break  # no progress -- avoid an infinite loop
+        current_end = earliest - timedelta(seconds=1)
+        time.sleep(request_delay)
+
+    if not all_chunks:
+        return None
+    combined = pd.concat(all_chunks, ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
+    return combined[combined["datetime"] >= target_start].reset_index(drop=True)
+
+
 def compute_trade_levels_variant(action: str, entry: float, atr: float, sl_mult: float, tp1_mult: float, tp2_mult: float) -> dict:
     """Like scalp_analysis.compute_trade_levels, but with configurable
     SL/TP multipliers -- lets us A/B test different risk:reward ratios
@@ -150,11 +211,6 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
 
     If TP1 is never reached, all after-TP1 fields are None (not zero) --
     the question "what happens after TP1" doesn't apply to that trade.
-
-    'exit_time' is the REAL moment the trade closed -- SL-hit time for a
-    loss, TP1-hit time for a win, or the window-end for an expired trade.
-    This is what the caller should use to know when the trade is truly
-    "no longer open," not the extended research observation window.
     """
     window_end = entry_time + timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
     forward = df_5m_full[(df_5m_full["datetime"] > entry_time) & (df_5m_full["datetime"] <= window_end)].reset_index(drop=True)
@@ -242,11 +298,19 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
 
 
 async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
-              sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0):
+              sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0,
+              deep_start_date: str | None = None, deep_end_date: str | None = None):
+    """deep_start_date/deep_end_date (format YYYY-MM-DD) switch to paginated
+    fetching for a much longer historical window (e.g. all of 2025) instead
+    of the default quick ~17-day fetch. This uses many more API requests
+    and takes considerably longer to replay -- see the workflow's own
+    warning about credit usage before running this during active hours."""
     # Tag variant runs distinctly so they never mix with the baseline
     # results already in the database for this symbol
     is_variant = (sl_mult, tp1_mult, tp2_mult) != (1.5, 1.0, 2.0)
     result_symbol = f"{display_symbol} (R:R {tp1_mult:.1f}:{sl_mult:.1f})" if is_variant else display_symbol
+    if deep_start_date and deep_end_date:
+        result_symbol = f"{result_symbol} [{deep_start_date} to {deep_end_date}]"
 
     cleared = db.clear_backtest_data(result_symbol)
     if cleared:
@@ -254,13 +318,24 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
 
     logger.info("Fetching historical data for %s...", display_symbol)
     dfs_full = {}
-    for label, interval in scalp_analysis.TIMEFRAMES.items():
-        df = fetch_full_history(api_symbol, interval)
-        if df is None or len(df) < WARMUP_BARS:
-            logger.error("Not enough historical data for %s on %s -- aborting backtest", display_symbol, label)
-            return
-        dfs_full[label] = df
-        logger.info("%s: %d candles, from %s to %s", label, len(df), df["datetime"].min(), df["datetime"].max())
+    if deep_start_date and deep_end_date:
+        target_start = datetime.strptime(deep_start_date, "%Y-%m-%d").replace(tzinfo=None)
+        target_end = datetime.strptime(deep_end_date, "%Y-%m-%d").replace(tzinfo=None) + timedelta(days=1)
+        for label, interval in scalp_analysis.TIMEFRAMES.items():
+            df = fetch_paginated_history(api_symbol, interval, target_start, target_end)
+            if df is None or len(df) < WARMUP_BARS:
+                logger.error("Not enough historical data for %s on %s -- aborting backtest", display_symbol, label)
+                return
+            dfs_full[label] = df
+            logger.info("%s: %d candles, from %s to %s", label, len(df), df["datetime"].min(), df["datetime"].max())
+    else:
+        for label, interval in scalp_analysis.TIMEFRAMES.items():
+            df = fetch_full_history(api_symbol, interval)
+            if df is None or len(df) < WARMUP_BARS:
+                logger.error("Not enough historical data for %s on %s -- aborting backtest", display_symbol, label)
+                return
+            dfs_full[label] = df
+            logger.info("%s: %d candles, from %s to %s", label, len(df), df["datetime"].min(), df["datetime"].max())
 
     # Bound the replay window to whatever timeframe has the least history
     # (in practice, 5-minute data, given the free-tier candle-count cap)
@@ -281,10 +356,6 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
     evaluated_count = 0
     actionable_count = 0
     continuation_count = 0
-    # Tracks the currently "open" trade, if any: same-direction signals that
-    # appear again before this trade's own exit time has passed are the SAME
-    # ongoing opportunity, not fresh independent trades -- without this, a
-    # single 4-hour trend shows up as 8 separate "wins" in a 30-min replay.
     open_direction = None
     open_exit_time = None
 
@@ -314,11 +385,6 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             and t <= open_exit_time
         )
         if is_continuation:
-            # Deliberately NOT logged at all -- this is the same ongoing
-            # trade as before, not a new evaluation. Logging it (even
-            # without an outcome) would still inflate the actionable count
-            # reported in summaries, recreating the exact over-counting
-            # problem this whole mechanism exists to fix.
             continuation_count += 1
             t += step
             continue
@@ -346,11 +412,6 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             returned_to_entry_after_tp1=detail["returned_to_entry_after_tp1"], time_to_exit_minutes=detail["time_to_exit_minutes"],
         )
 
-        # Mark this trade as "open" until its ACTUAL exit time (SL hit for a
-        # loss, TP1 hit for a win, or window-end for expired) -- using the
-        # real, tight exit_time here, NOT a blanket fallback, matters a lot:
-        # a wrong 24-hour default here would suppress genuinely new trades
-        # for a full day after every loss.
         open_direction = decision["action"]
         open_exit_time = detail["exit_time"]
 
@@ -372,7 +433,15 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
     else:
         lines.append("No actionable signals resolved in this window.")
     lines.append("")
-    lines.append("_Limited to ~17 days of 5-minute history (free-tier cap). Small sample -- a starting point, not proof of an edge._")
+    if deep_start_date and deep_end_date:
+        lines.append(
+            f"_Deep backtest requested {deep_start_date} to {deep_end_date}. Actual achieved range shown above -- "
+            f"if it's shorter than requested, that's the real historical depth limit for this symbol on the free tier, "
+            f"discovered by the fetch itself rather than assumed. Still a single historical window, not out-of-sample "
+            f"validation._"
+        )
+    else:
+        lines.append("_Limited to ~17 days of 5-minute history (free-tier cap). Small sample -- a starting point, not proof of an edge._")
 
     await telegram_bot.send_text("\n".join(lines))
     logger.info("Sent backtest summary")
