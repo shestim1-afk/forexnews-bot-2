@@ -601,9 +601,16 @@ async def run():
     otherwise, rather than a scheduled digest regardless of content."""
     blocks = []
     for i, symbol_cfg in enumerate(SYMBOLS):
-        block, actionable_signals, actionable = analyze_symbol(symbol_cfg)
+                block, actionable_signals, actionable = analyze_symbol(symbol_cfg)
         risk_lines = []
         for sig in actionable_signals:
+            open_signal = db.get_open_signal(sig["symbol"], sig["strategy_type"])
+            is_continuation = open_signal is not None and open_signal["action"] == sig["action"]
+
+            if is_continuation:
+                risk_lines.append(f"↻ {sig['strategy_type']}: still the same open trade from before, not a new entry")
+                continue
+
             risk_usd = config.ACCOUNT_SIZE_USD * (config.RISK_PCT_PER_TRADE / 100)
             allowed, reason = risk_controller.check_and_reserve(risk_usd)
             db.save_scalp_signal(
