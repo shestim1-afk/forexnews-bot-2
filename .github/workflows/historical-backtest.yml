@@ -3,6 +3,21 @@ name: Historical Backtest
 # Manual-only (no schedule) -- this is a deep, occasional analysis you run
 # when you want it, not something that needs to fire automatically. Choose
 # the symbol when triggering it manually from the Actions tab.
+#
+# Leave deep_start_date/deep_end_date blank for the fast default (~17 days
+# via a single request per timeframe). Fill both in (e.g. 2025-01-01 to
+# 2025-12-31) for a much longer historical window -- this uses many more
+# API requests (roughly 30-70 depending on symbol/timeframe) and takes
+# noticeably longer to run (likely 10-20+ minutes). Twelve Data's own docs
+# say intraday forex/crypto history can reach back up to a year, but this
+# isn't confirmed for the free tier specifically -- the run will discover
+# the real depth limit itself and report whatever range was actually
+# achieved, rather than assuming the full request succeeded.
+#
+# IMPORTANT: this shares the same daily API credit budget (800/day) as the
+# live scalp bot's regular scanning. Avoid running a deep backtest during
+# hours when the live bot is also actively scanning, to avoid exhausting
+# the daily limit for both.
 on:
   workflow_dispatch:
     inputs:
@@ -26,6 +41,14 @@ on:
         description: "TP2 distance, as a multiple of ATR (live bot default: 2.0)"
         required: false
         default: "2.0"
+      deep_start_date:
+        description: "Deep backtest start date, YYYY-MM-DD (leave blank for the fast ~17-day default)"
+        required: false
+        default: ""
+      deep_end_date:
+        description: "Deep backtest end date, YYYY-MM-DD (leave blank for the fast ~17-day default)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -34,7 +57,7 @@ permissions:
 jobs:
   historical-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - name: Check out the code
         uses: actions/checkout@v4
@@ -64,11 +87,15 @@ jobs:
           python -c "
           import asyncio
           from bot.historical_backtest import run
+          deep_start = '${{ github.event.inputs.deep_start_date }}' or None
+          deep_end = '${{ github.event.inputs.deep_end_date }}' or None
           asyncio.run(run(
               api_symbol='${{ github.event.inputs.api_symbol }}',
               display_symbol='${{ github.event.inputs.display_symbol }}',
               sl_mult=float('${{ github.event.inputs.sl_mult }}'),
               tp1_mult=float('${{ github.event.inputs.tp1_mult }}'),
               tp2_mult=float('${{ github.event.inputs.tp2_mult }}'),
+              deep_start_date=deep_start,
+              deep_end_date=deep_end,
           ))
           "
