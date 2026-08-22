@@ -20,10 +20,9 @@ signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
 for outcome-checking, since it's self-contained historical data).
 
-A persistent multi-hour trend is tracked as ONE open trade, not counted
-again every 30-min replay step -- otherwise a single 4-hour trend would
-inflate the actionable count 8x over. A new same-direction signal only
-counts as fresh once the prior one has actually reached its own exit time.
+A persistent multi-hour trend is tracked as ONE open trade using its ACTUAL
+exit time (SL hit time for a loss, TP1 hit time for a win, window-end for
+expired) -- not counted again every 30-min replay step.
 """
 
 import asyncio
@@ -151,6 +150,11 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
 
     If TP1 is never reached, all after-TP1 fields are None (not zero) --
     the question "what happens after TP1" doesn't apply to that trade.
+
+    'exit_time' is the REAL moment the trade closed -- SL-hit time for a
+    loss, TP1-hit time for a win, or the window-end for an expired trade.
+    This is what the caller should use to know when the trade is truly
+    "no longer open," not the extended research observation window.
     """
     window_end = entry_time + timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
     forward = df_5m_full[(df_5m_full["datetime"] > entry_time) & (df_5m_full["datetime"] <= window_end)].reset_index(drop=True)
@@ -158,7 +162,7 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
 
     max_adverse_before, max_favorable_before = 0.0, 0.0
     tp1_hit, tp1_hit_time, tp1_row_idx = False, None, None
-    outcome, exit_price, r_multiple = None, None, None
+    outcome, exit_price, r_multiple, exit_time = None, None, None, None
 
     for i in range(len(forward)):
         c = forward.iloc[i]
@@ -175,20 +179,24 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
 
             if hit_sl:
                 outcome, exit_price, r_multiple = "LOSS", sl, -1.0
+                exit_time = c["datetime"]
                 break
             if hit_tp1_now:
                 tp1_hit, tp1_hit_time, tp1_row_idx = True, c["datetime"], i
                 profit = (tp1 - entry) if action == "LONG" else (entry - tp1)
                 outcome, exit_price, r_multiple = "WIN", tp1, (profit / risk if risk else 0.0)
+                exit_time = c["datetime"]  # the real exit -- continued observation below is research-only
                 # deliberately do NOT break -- continue below for research only
 
     if outcome is None:
-        last_close = forward.iloc[-1]["close"] if len(forward) else entry
+        last_row = forward.iloc[-1] if len(forward) else None
+        last_close = last_row["close"] if last_row is not None else entry
+        exit_time = last_row["datetime"] if last_row is not None else window_end
         profit = (last_close - entry) if action == "LONG" else (entry - last_close)
         outcome, exit_price, r_multiple = "EXPIRED", last_close, (profit / risk if risk else 0.0)
 
     result = {
-        "outcome": outcome, "exit_price": exit_price, "r_multiple": r_multiple,
+        "outcome": outcome, "exit_price": exit_price, "r_multiple": r_multiple, "exit_time": exit_time,
         "mae_before_tp1_r": max_adverse_before / risk if risk else 0.0,
         "mfe_before_tp1_r": max_favorable_before / risk if risk else 0.0,
         "tp1_hit": tp1_hit,
@@ -289,6 +297,13 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
         tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest = result
 
         if decision["action"] == "NO TRADE":
+            db.save_evaluation(
+                source="backtest", symbol=result_symbol, strategy_type="trend", action="NO TRADE",
+                confidence=decision["confidence"], entry=None, sl=None, tp1=None, tp2=None,
+                details=f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']}",
+                evaluated_at=t.isoformat(),
+            )
+            evaluated_count += 1
             open_direction, open_exit_time = None, None
             t += step
             continue
@@ -299,6 +314,11 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             and t <= open_exit_time
         )
         if is_continuation:
+            # Deliberately NOT logged at all -- this is the same ongoing
+            # trade as before, not a new evaluation. Logging it (even
+            # without an outcome) would still inflate the actionable count
+            # reported in summaries, recreating the exact over-counting
+            # problem this whole mechanism exists to fix.
             continuation_count += 1
             t += step
             continue
@@ -326,14 +346,13 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             returned_to_entry_after_tp1=detail["returned_to_entry_after_tp1"], time_to_exit_minutes=detail["time_to_exit_minutes"],
         )
 
-        # Mark this trade as "open" until its own exit time -- any
-        # same-direction signal appearing before then is a continuation,
-        # not a fresh independent trade
+        # Mark this trade as "open" until its ACTUAL exit time (SL hit for a
+        # loss, TP1 hit for a win, or window-end for expired) -- using the
+        # real, tight exit_time here, NOT a blanket fallback, matters a lot:
+        # a wrong 24-hour default here would suppress genuinely new trades
+        # for a full day after every loss.
         open_direction = decision["action"]
-        if detail["time_to_exit_minutes"] is not None:
-            open_exit_time = t + timedelta(minutes=detail["time_to_exit_minutes"])
-        else:
-            open_exit_time = t + timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
+        open_exit_time = detail["exit_time"]
 
         t += step
 
