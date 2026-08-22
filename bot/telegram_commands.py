@@ -19,6 +19,7 @@ from . import config
 from . import db
 from . import scalp_analysis
 from . import backtest_signals
+from . import risk_controller
 from . import telegram_bot
 
 logging.basicConfig(
@@ -33,6 +34,7 @@ HELP_TEXT = (
     "/gold or /xauusd -- fresh Gold scan\n"
     "/gbpjpy -- fresh GBP/JPY scan\n"
     "/stats -- current win/loss record so far\n"
+    "/riskstatus -- today's simulated risk/P&L status\n"
     "/help -- this message\n\n"
     "_Replies arrive within a few minutes, not instantly -- this checks for new messages periodically rather than listening live._"
 )
@@ -103,7 +105,7 @@ async def reply_to(chat_id: str, text: str) -> None:
 
 
 async def handle_command(chat_id: str, command: str) -> None:
-    command = command.lower().split("@")[0]
+    command = command.lower().split("@")[0]  # strip @botname if present
 
     if command == "/help" or command == "/start":
         await reply_to(chat_id, HELP_TEXT)
@@ -111,6 +113,10 @@ async def handle_command(chat_id: str, command: str) -> None:
 
     if command == "/stats":
         await reply_to(chat_id, format_stats_message())
+        return
+
+    if command == "/riskstatus":
+        await reply_to(chat_id, risk_controller.format_status())
         return
 
     api_symbol = scalp_analysis.COMMAND_TO_SYMBOL.get(command)
