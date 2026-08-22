@@ -35,6 +35,7 @@ import ta
 
 from . import config
 from . import db
+from . import risk_controller
 from . import telegram_bot
 
 logging.basicConfig(
@@ -162,6 +163,11 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
 def detect_rsi_divergence(df: pd.DataFrame, window: int = 5, lookback: int = 75,
                            min_gap: float = 5, extreme_floor: float = 10, extreme_ceiling: float = 90) -> str | None:
+    """Compares the two most recent significant price swing lows/highs
+    against RSI at those same points. Known limitation: RSI is bounded at
+    0-100, so a comparison starting from an already-extreme reading can look
+    like divergence just from having nowhere further to go -- the floor/
+    ceiling guards mitigate this, though it's a heuristic, not a perfect fix."""
     close = df["close"]
     rsi_series = ta.momentum.RSIIndicator(close, window=14).rsi()
     highs = df["high"].tolist()[-lookback:]
@@ -247,6 +253,15 @@ def detect_range_setup(tf_data: dict, dfs: dict, divergence: str | None) -> dict
 
 def detect_liquidity_sweep(df: pd.DataFrame, atr: float, window: int = 3, recent_candles: int = 3,
                             min_pierce_atr_mult: float = 0.15) -> dict | None:
+    """Detects a stop-hunt pattern: price briefly pierces a well-established
+    prior swing high/low (where resting stop orders cluster), then quickly
+    rejects back inside the range -- a genuine reversal signal, distinct
+    from a confirmed breakout. Established levels are computed excluding
+    the most recent candles, so the sweep can't be "detecting" its own
+    formation. min_pierce_atr_mult requires both the pierce beyond the level
+    and the rejection back past it to be a meaningful fraction of ATR, not
+    just noise-level wiggle -- without this, the pattern fires constantly
+    on pure noise in a flat, quiet market."""
     n = len(df)
     established = df.iloc[:-recent_candles] if n > recent_candles else df
     highs_e = established["high"].tolist()
@@ -280,6 +295,11 @@ def detect_liquidity_sweep(df: pd.DataFrame, atr: float, window: int = 3, recent
 
 def detect_breakout_retest(df: pd.DataFrame, atr: float, window: int = 3, lookback_recent: int = 20,
                             breakout_atr_mult: float = 0.3, retest_atr_mult: float = 0.3, min_bars_after: int = 2) -> dict | None:
+    """Detects: a level broke decisively (close beyond it by a meaningful
+    ATR margin), price later pulled back to retest that level without
+    closing back through it (confirming it flipped from resistance to
+    support, or vice versa), and the current candle is bouncing away from
+    the retest -- a continuation entry, not just any pass through a level."""
     established = df.iloc[:-lookback_recent]
     recent = df.iloc[-lookback_recent:]
     highs_e, lows_e = established["high"].tolist(), established["low"].tolist()
@@ -388,6 +408,12 @@ def compute_trade_levels(action: str, entry: float, atr: float) -> dict:
 
 
 def calculate_position_size(display_symbol: str, entry: float | None, sl: float | None) -> str | None:
+    """Given the account size and risk % configured in config.py (or via
+    ACCOUNT_SIZE_USD / RISK_PCT_PER_TRADE env vars), computes the position
+    size that risks exactly that amount if SL is hit. Forex sizing is
+    approximate -- verify against your broker's own calculator before using
+    real numbers, since precise pip-value conversion depends on your
+    account's currency."""
     if entry is None or sl is None or entry == sl:
         return None
     risk_amount = config.ACCOUNT_SIZE_USD * (config.RISK_PCT_PER_TRADE / 100)
@@ -409,6 +435,9 @@ LABEL_EMOJI = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
 def format_symbol_block(display_symbol: str, tf_data: dict, decision: dict, levels: dict,
                          news_direction: str, news_summary: str, range_setup: dict | None,
                          divergence: str | None, sweep: dict | None, breakout_retest: dict | None) -> str:
+    """Always builds the FULL diagnostic picture (used as-is for on-demand
+    /commands). The scheduled digest decides separately whether to include
+    this block based on is_actionable()."""
     lines = [f"*{display_symbol}*"]
     for tf_label in ["4h", "1h", "15m", "5m"]:
         d = tf_data[tf_label]
@@ -481,6 +510,12 @@ def is_actionable(decision: dict, range_setup: dict | None, sweep: dict | None, 
 
 
 def analyze_symbol(symbol_cfg: dict) -> tuple[str, list[dict], bool]:
+    """Runs the full pipeline for one symbol. Returns (message_block,
+    actionable_signals, is_actionable) where actionable_signals is a list of
+    dicts ready for db.save_scalp_signal(), one per fired signal type (a
+    symbol can fire more than one simultaneously, e.g. a trend signal AND a
+    liquidity sweep). Used by both the scheduled digest and on-demand
+    Telegram commands."""
     api_symbol = symbol_cfg["api"]
     display = symbol_cfg["display"]
 
@@ -567,13 +602,22 @@ async def run():
     blocks = []
     for i, symbol_cfg in enumerate(SYMBOLS):
         block, actionable_signals, actionable = analyze_symbol(symbol_cfg)
+        risk_lines = []
         for sig in actionable_signals:
+            risk_usd = config.ACCOUNT_SIZE_USD * (config.RISK_PCT_PER_TRADE / 100)
+            allowed, reason = risk_controller.check_and_reserve(risk_usd)
             db.save_scalp_signal(
                 symbol=sig["symbol"], action=sig["action"], entry=sig["entry"], sl=sig["sl"],
                 tp1=sig["tp1"], tp2=sig["tp2"], confidence=sig["confidence"], details=sig["details"],
-                strategy_type=sig["strategy_type"],
+                strategy_type=sig["strategy_type"], risk_allowed=allowed,
             )
+            status_emoji = "✅" if allowed else "⛔"
+            status_text = "would be taken" if allowed else f"SKIPPED -- {reason}"
+            risk_lines.append(f"{status_emoji} {sig['strategy_type']}: {status_text}")
+
         if actionable:
+            if risk_lines:
+                block = block + "\n\n_Risk check (paper-trading simulation):_\n" + "\n".join(risk_lines)
             blocks.append(block)
         else:
             logger.info("%s: nothing actionable this cycle", symbol_cfg["display"])
