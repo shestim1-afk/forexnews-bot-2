@@ -522,3 +522,29 @@ def clear_backtest_data(symbol: str) -> int:
         return len(eval_ids)
     finally:
         conn.close()
+
+
+
+def get_open_signal(symbol: str, strategy_type: str) -> dict | None:
+    """Returns the most recent LONG/SHORT signal for this symbol+strategy
+    combination if IT specifically hasn't been evaluated yet -- meaning, as
+    far as we know, that trade is still "open". Used to decide whether a
+    new signal is a genuinely fresh opportunity or the same persisting
+    trend showing up again on the next scan. Returns None if there's no
+    prior signal, or if the most recent one has already resolved."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """SELECT s.id, s.action,
+                      (SELECT COUNT(*) FROM signal_outcomes o WHERE o.signal_id = s.id) AS has_outcome
+               FROM scalp_signals s
+               WHERE s.symbol = ? AND s.strategy_type = ? AND s.action != 'NO TRADE'
+               ORDER BY s.created_at DESC
+               LIMIT 1""",
+            (symbol, strategy_type),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or row[2] > 0:
+        return None  # no prior signal, or the most recent one already resolved
+    return {"id": row[0], "action": row[1]}
