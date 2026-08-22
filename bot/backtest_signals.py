@@ -26,7 +26,9 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
+from . import config
 from . import db
+from . import risk_controller
 from . import scalp_analysis
 from . import telegram_bot
 
@@ -41,6 +43,11 @@ LOOKAHEAD_HOURS = 48
 
 
 def fetch_price_window(api_symbol: str, start_dt: datetime, end_dt: datetime) -> list[dict] | None:
+    """Fetches 15-minute candles between two timestamps via Twelve Data.
+    Assumes Twelve Data's returned timestamps are UTC, matching how this
+    project stores signal creation times -- if that assumption is ever
+    wrong for a given symbol, evaluations could be mistimed. Worth
+    revisiting if outcomes look implausible."""
     if not scalp_analysis.TWELVEDATA_API_KEY:
         return None
     try:
@@ -61,7 +68,7 @@ def fetch_price_window(api_symbol: str, start_dt: datetime, end_dt: datetime) ->
             logger.warning("Twelve Data error fetching window for %s: %s", api_symbol, data.get("message", data))
             return None
         values = data["values"]
-        values.reverse()
+        values.reverse()  # oldest first
         return [{"high": float(c["high"]), "low": float(c["low"]), "close": float(c["close"])} for c in values]
     except Exception as e:
         logger.warning("Failed to fetch price window for %s: %s", api_symbol, e)
@@ -69,6 +76,7 @@ def fetch_price_window(api_symbol: str, start_dt: datetime, end_dt: datetime) ->
 
 
 def evaluate_signal(signal: dict, candles: list[dict]) -> tuple[str, float, float]:
+    """Returns (outcome, exit_price, r_multiple)."""
     entry, sl, tp1, action = signal["entry"], signal["sl"], signal["tp1"], signal["action"]
     risk = abs(entry - sl)
 
@@ -76,17 +84,19 @@ def evaluate_signal(signal: dict, candles: list[dict]) -> tuple[str, float, floa
         if action == "LONG":
             hit_sl = c["low"] <= sl
             hit_tp1 = c["high"] >= tp1
-        else:
+        else:  # SHORT
             hit_sl = c["high"] >= sl
             hit_tp1 = c["low"] <= tp1
 
-        if hit_sl:
-            return "LOSS", sl, -1.0
+        if hit_sl:  # checked first -- conservative on same-bar ambiguity
+            r = -1.0
+            return "LOSS", sl, r
         if hit_tp1:
             profit = (tp1 - entry) if action == "LONG" else (entry - tp1)
             r = profit / risk if risk else 0.0
             return "WIN", tp1, r
 
+    # Neither hit within the window
     last_close = candles[-1]["close"] if candles else entry
     profit = (last_close - entry) if action == "LONG" else (entry - last_close)
     r = profit / risk if risk else 0.0
@@ -110,10 +120,13 @@ async def run():
 
         candles = fetch_price_window(api_symbol, created_at, window_end)
         if candles is None:
-            continue
+            continue  # try again next run
 
         outcome, exit_price, r_multiple = evaluate_signal(signal, candles)
 
+        # Only finalize EXPIRED once the full lookahead window has actually
+        # elapsed -- otherwise leave it unevaluated so a later run can still
+        # catch a legitimate late TP/SL hit.
         window_fully_elapsed = (datetime.now(timezone.utc) - created_at) >= timedelta(hours=LOOKAHEAD_HOURS)
         if outcome == "EXPIRED" and not window_fully_elapsed:
             continue
@@ -121,6 +134,15 @@ async def run():
         db.save_signal_outcome(signal["id"], outcome, exit_price, r_multiple)
         evaluated_count += 1
         logger.info("Signal #%d (%s %s): %s, R=%.2f", signal["id"], signal["symbol"], signal["action"], outcome, r_multiple)
+
+        # Only feed this outcome into the daily risk controller if it was
+        # actually "taken" under the risk framework at generation time --
+        # a signal that was SKIPPED for exceeding a daily limit shouldn't
+        # count against that day's simulated P&L or loss streak.
+        if signal.get("risk_allowed"):
+            signal_date_key = created_at.strftime("%Y-%m-%d")
+            risk_usd = config.ACCOUNT_SIZE_USD * (config.RISK_PCT_PER_TRADE / 100)
+            risk_controller.record_outcome(r_multiple, risk_usd, date_key=signal_date_key)
 
     if evaluated_count == 0:
         logger.info("No new outcomes finalized this run")
@@ -131,6 +153,8 @@ async def run():
 
 
 def format_full_stats_message(newly_evaluated: int | None = None) -> str:
+    """Shared formatter used both by this daily backtest job and the
+    on-demand /stats Telegram command, so both show identical numbers."""
     stats = db.get_outcome_stats()
     strategy_stats = db.get_strategy_type_stats()
 
