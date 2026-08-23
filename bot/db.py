@@ -601,3 +601,45 @@ def get_backtest_strategy_type_stats(symbol: str) -> list[dict]:
             "profit_factor": profit_factor, "max_drawdown_r": max_dd,
         })
     return sorted(result, key=lambda x: -x["trades"])
+
+def get_strategy_evidence_label(api_symbol: str, strategy_type: str, min_sample: int = 200) -> str:
+    """Looks up this symbol+strategy_type's own historical backtest track
+    record (pooling all non-variant backtest runs -- both the quick ~17-day
+    ones and any deep multi-month ones, but excluding R:R-variant test runs
+    which use different SL/TP ratios) and returns a short evidence label to
+    attach to live alerts. Matches by prefix since deep-backtest runs tag
+    their symbol with a date-range suffix (e.g. "BTC/USD [2025-01-01 to
+    2025-12-31]") rather than the plain symbol string."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT o.outcome, o.r_multiple
+               FROM backtest_outcomes o
+               JOIN all_evaluations e ON e.id = o.evaluation_id
+               WHERE e.source='backtest' AND e.strategy_type=?
+                 AND e.symbol LIKE ? AND e.symbol NOT LIKE '%(R:R%'""",
+            (strategy_type, f"{api_symbol}%"),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    wins = sum(1 for o, r in rows if o == "WIN")
+    losses = sum(1 for o, r in rows if o == "LOSS")
+    resolved = wins + losses
+    if resolved < min_sample:
+        return f"⚪ backtest sample too small yet (n={resolved}) -- treat cautiously"
+
+    r_sum = sum(r for o, r in rows if o in ("WIN", "LOSS"))
+    avg_r = r_sum / resolved
+    gains = sum(r for o, r in rows if o == "WIN")
+    loss_sum = abs(sum(r for o, r in rows if o == "LOSS"))
+    pf = gains / loss_sum if loss_sum > 0 else None
+    pf_str = f"{pf:.2f}" if pf is not None else "N/A"
+
+    if avg_r > 0.01:
+        emoji = "🟢"
+    elif avg_r < -0.01:
+        emoji = "🔴"
+    else:
+        emoji = "⚪"
+    return f"{emoji} backtested: {avg_r:+.2f}R avg, PF {pf_str} (n={resolved})"
