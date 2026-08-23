@@ -3,13 +3,6 @@ this module produces is explicitly labeled EXPLORATORY -- hypothesis
 material for future validation on a larger sample, NOT evidence to change
 the live bot's actual behavior. The live bot's 55% confidence threshold
 stays fixed regardless of what these reports show.
-
-Statistical guardrail, stated plainly: with roughly 170-270 actionable
-trades per symbol from a single 17-day window, splitting further by
-threshold shrinks each bucket further. A threshold that looks better here
-could easily just be a smaller, noisier sample looking better by chance --
-that's exactly the trap this analysis exists to avoid falling into, not
-evidence to act on.
 """
 
 import asyncio
@@ -29,10 +22,6 @@ EXCURSION_THRESHOLDS_R = [1.0, 1.5, 2.0]
 
 
 def compute_metrics(rows: list[tuple]) -> dict:
-    """rows: (outcome, r_multiple) tuples, in chronological order.
-    'avg_r' here IS the per-trade expectancy in R-multiples -- the standard
-    win_rate*avg_win - loss_rate*avg_loss formula collapses to exactly this
-    when computed directly from the realized R sequence."""
     wins = sum(1 for o, r in rows if o == "WIN")
     losses = sum(1 for o, r in rows if o == "LOSS")
     resolved = wins + losses
@@ -125,8 +114,7 @@ async def run_confidence_threshold_analysis(symbols: list[str] | None = None):
 
     lines.append(
         "_Note: range/liquidity-sweep/breakout-retest signals all carry a fixed 60% confidence tag "
-        "(not a computed score like trend signals), so thresholds above 60% filter them out as a block, "
-        "not gradually -- this test mainly varies the 'trend' signal count._"
+        "so thresholds above 60% filter them out as a block, not gradually._"
     )
 
     await telegram_bot.send_text("\n".join(lines))
@@ -134,8 +122,6 @@ async def run_confidence_threshold_analysis(symbols: list[str] | None = None):
 
 
 def percentile(sorted_values: list[float], pct: float) -> float | None:
-    """Simple linear-interpolation percentile, no numpy dependency needed.
-    pct in [0, 100]. Returns None for an empty list."""
     if not sorted_values:
         return None
     if len(sorted_values) == 1:
@@ -148,8 +134,6 @@ def percentile(sorted_values: list[float], pct: float) -> float | None:
 
 
 def get_excursion_rows(symbol: str | None = None, strategy_type: str | None = None) -> list[dict]:
-    """Returns per-trade excursion data for the requested slice (by symbol
-    and/or strategy_type -- pass None to not filter on that dimension)."""
     conditions, params = ["e.source = 'backtest'"], []
     if symbol:
         conditions.append("e.symbol = ?")
@@ -175,10 +159,6 @@ def get_excursion_rows(symbol: str | None = None, strategy_type: str | None = No
 
 
 def compute_excursion_stats(rows: list[dict]) -> dict | None:
-    """Median/25th/75th percentile MAE & MFE, plus % of trades reaching
-    TP1, TP2, and 1R/1.5R/2R (using the trade's best overall favorable
-    excursion -- mfe_after_tp1_r when available and larger, since that
-    reflects the true peak measured from entry, otherwise mfe_before_tp1_r)."""
     if not rows:
         return None
 
@@ -211,16 +191,12 @@ def compute_excursion_stats(rows: list[dict]) -> dict | None:
 
 
 async def run_excursion_report(symbols: list[str] | None = None, strategy_types: list[str] | None = None):
-    """Aggregate MAE/MFE report -- median/percentiles and % reaching various
-    milestones, broken down by symbol and strategy type. EXPLORATORY, same
-    caveats as the confidence threshold analysis: don't draw conclusions
-    from small slices, this is data collection, not optimization."""
     symbols = symbols or ["BTC/USD", "XAU/USD"]
-    strategy_types = strategy_types or ["trend"]  # currently the only type logged by the historical backtester
+    strategy_types = strategy_types or ["trend"]
 
     lines = [
         "*📐 MAE/MFE Excursion Report*",
-        "_EXPLORATORY -- data collection, not optimization. Do not conclude a TP change is warranted from this alone._\n",
+        "_EXPLORATORY -- data collection, not optimization._\n",
     ]
 
     for symbol in symbols:
@@ -237,12 +213,10 @@ async def run_excursion_report(symbols: list[str] | None = None, strategy_types:
                 f"MAE median {stats['mae_median']:.2f}R (p25 {stats['mae_p25']:.2f}, p75 {stats['mae_p75']:.2f}), "
                 f"MFE median {stats['mfe_median']:.2f}R (p25 {stats['mfe_p25']:.2f}, p75 {stats['mfe_p75']:.2f})"
             )
-            lines.append(
-                f"    Reached TP1: {stats['pct_reaching_tp1']:.0f}% | TP2: {stats['pct_reaching_tp2']:.0f}% | {r_pct_str}"
-            )
+            lines.append(f"    Reached TP1: {stats['pct_reaching_tp1']:.0f}% | TP2: {stats['pct_reaching_tp2']:.0f}% | {r_pct_str}")
         lines.append("")
 
-    lines.append("_MAE/MFE measured only from actual post-entry price action, before the trade's real exit. Overall MFE combines before/after-TP1 peaks where applicable._")
+    lines.append("_MAE/MFE measured only from actual post-entry price action._")
 
     await telegram_bot.send_text("\n".join(lines))
     logger.info("Sent excursion report")
@@ -259,9 +233,6 @@ DEFAULT_SPREAD_PCT = {
 
 
 def get_raw_stats_for_symbol_prefix(api_symbol: str, strategy_type: str) -> dict | None:
-    """Same prefix-matching as get_cost_adjusted_stats (to correctly find
-    deep-backtest data tagged with a date-range suffix), computing the
-    UN-adjusted baseline stats for direct before/after comparison."""
     conn = db._connect()
     try:
         rows = conn.execute(
@@ -290,11 +261,7 @@ def get_raw_stats_for_symbol_prefix(api_symbol: str, strategy_type: str) -> dict
 def get_cost_adjusted_stats(api_symbol: str, strategy_type: str, spread_pct: float | None = None) -> dict | None:
     """Recomputes win/loss/PF using each trade's OWN real stored entry/SL
     distance (not an estimate) to convert an assumed spread cost into an
-    R-multiple, then subtracts that from every trade's realized R --
-    winners get smaller, losers get worse, and a trade close to breakeven
-    can flip from a nominal win to a real loss once costs are included.
-    This is the honest question the raw backtest numbers never answer:
-    does the edge survive contact with real execution costs?"""
+    R-multiple, then subtracts that from every trade's realized R."""
     spread_pct = spread_pct if spread_pct is not None else DEFAULT_SPREAD_PCT.get(api_symbol, 0.05)
     conn = db._connect()
     try:
@@ -341,17 +308,13 @@ def get_cost_adjusted_stats(api_symbol: str, strategy_type: str, spread_pct: flo
 
 
 async def run_cost_adjusted_report(api_symbol: str, spread_pct: float | None = None):
-    """Sends a before/after comparison for each strategy type on this
-    symbol, showing whether the raw backtested edge survives a realistic
-    spread cost. This is an estimate, not a guarantee -- real costs depend
-    on your actual broker/exchange."""
     strategy_types = ["trend", "range", "liquidity_sweep", "breakout_retest"]
     used_pct = spread_pct if spread_pct is not None else DEFAULT_SPREAD_PCT.get(api_symbol, 0.05)
 
     lines = [
         f"*💸 Transaction-Cost-Adjusted Backtest: {api_symbol}*",
-        f"_Assuming {used_pct:.2f}% round-trip spread cost (estimate -- replace with your real broker's spread for a meaningful answer). "
-        f"Each trade's own actual entry/SL distance is used to convert this into an R-cost, not a flat guess._\n",
+        f"_Assuming {used_pct:.2f}% round-trip spread cost (estimate). "
+        f"Each trade's own actual entry/SL distance is used to convert this into an R-cost._\n",
     ]
 
     for strategy_type in strategy_types:
@@ -372,10 +335,95 @@ async def run_cost_adjusted_report(api_symbol: str, spread_pct: float | None = N
         lines.append(f"  After costs:  avg R {adj['avg_r']:+.3f}, PF {adj_pf}  -- {verdict}")
         lines.append("")
 
-    lines.append("_This is a simplified model (flat cost subtracted from realized R, not a full slippage-adjusted re-simulation) -- treat as directional, not exact._")
+    lines.append("_Simplified model (flat cost subtracted from realized R) -- treat as directional, not exact._")
 
     await telegram_bot.send_text("\n".join(lines))
     logger.info("Sent cost-adjusted report for %s", api_symbol)
+
+
+def calculate_required_risk_for_target(trades_per_day: float, avg_r_after_cost: float, target_daily_profit: float) -> dict:
+    """Given a real (cost-adjusted) edge and trade frequency, computes the
+    risk-per-trade needed to reach a target daily profit -- and the account
+    size that risk implies at 1% risk/trade. This is the honest way to
+    answer "what does it take to hit my target", using a MEASURED edge,
+    not a hoped-for one. Flags infeasibility if the edge is zero or
+    negative, since no amount of position sizing fixes a losing edge --
+    only a real, positive edge scales with risk."""
+    if avg_r_after_cost <= 0 or trades_per_day <= 0:
+        return {
+            "feasible": False,
+            "reason": "Edge is zero or negative after costs -- no position sizing fixes a losing edge. "
+                      "A larger risk per trade would only lose money faster, not slower.",
+        }
+
+    expected_daily_r = trades_per_day * avg_r_after_cost
+    required_risk_per_trade = target_daily_profit / expected_daily_r
+    implied_account_size_at_1pct = required_risk_per_trade / 0.01
+
+    return {
+        "feasible": True,
+        "trades_per_day": trades_per_day,
+        "avg_r_after_cost": avg_r_after_cost,
+        "expected_daily_r": expected_daily_r,
+        "required_risk_per_trade": required_risk_per_trade,
+        "implied_account_size_at_1pct_risk": implied_account_size_at_1pct,
+    }
+
+
+async def run_target_calculator(api_symbol: str, target_daily_profit: float = 30.0,
+                                 trades_per_day: float | None = None, spread_pct: float | None = None):
+    """Pulls trend's REAL cost-adjusted edge and trade frequency from
+    already-collected backtest data and reports what risk-per-trade and
+    account size would be needed to reach the target, using measured
+    numbers rather than assumptions."""
+    if trades_per_day is None:
+        conn = db._connect()
+        try:
+            row = conn.execute(
+                """SELECT MIN(evaluated_at), MAX(evaluated_at), COUNT(*)
+                   FROM all_evaluations
+                   WHERE source='backtest' AND strategy_type='trend' AND action != 'NO TRADE'
+                     AND symbol LIKE ? AND symbol NOT LIKE '%(R:R%'""",
+                (f"{api_symbol}%",),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or row[2] == 0:
+            await telegram_bot.send_text(f"*🎯 Target Calculator: {api_symbol}*\n\nNo trend backtest data found for this symbol -- run a Historical Backtest first.")
+            return
+        import datetime as dt
+        start = dt.datetime.fromisoformat(row[0])
+        end = dt.datetime.fromisoformat(row[1])
+        days = max((end - start).total_seconds() / 86400, 1e-9)
+        trades_per_day = row[2] / days
+
+    adj = get_cost_adjusted_stats(api_symbol, "trend", spread_pct)
+    if adj is None:
+        await telegram_bot.send_text(f"*🎯 Target Calculator: {api_symbol}*\n\nNo resolved trend trades found to compute a cost-adjusted edge.")
+        return
+
+    calc = calculate_required_risk_for_target(trades_per_day, adj["avg_r"], target_daily_profit)
+
+    lines = [f"*🎯 Target Calculator: {api_symbol}*", f"_Target: €{target_daily_profit:.0f}/day net, using trend's REAL measured cost-adjusted edge._\n"]
+    lines.append(f"Measured: {trades_per_day:.1f} trades/day, avg R after costs {adj['avg_r']:+.3f} (spread assumption {adj['spread_pct_used']:.2f}%)")
+
+    if not calc["feasible"]:
+        lines.append("")
+        lines.append(f"❌ *Not feasible at any risk size.* {calc['reason']}")
+    else:
+        lines.append("")
+        lines.append(f"Expected daily R: {calc['expected_daily_r']:+.3f}")
+        lines.append(f"Required risk per trade: €{calc['required_risk_per_trade']:.2f}")
+        lines.append(f"Implied account size (at 1% risk/trade): €{calc['implied_account_size_at_1pct_risk']:.0f}")
+        lines.append("")
+        lines.append(
+            "_This assumes the measured edge holds going forward, which is never guaranteed -- "
+            "treat this as 'what it would take IF the edge is real', not a promise it will happen. "
+            "Taxes are not modeled here; the target should be set net of taxes if that matters to you._"
+        )
+
+    await telegram_bot.send_text("\n".join(lines))
+    logger.info("Sent target calculator for %s", api_symbol)
 
 
 if __name__ == "__main__":
