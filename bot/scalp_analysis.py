@@ -407,6 +407,30 @@ def compute_trade_levels(action: str, entry: float, atr: float) -> dict:
     return {"entry": None, "sl": None, "tp1": None, "tp2": None}
 
 
+def compute_sweep_breakout_levels(direction: str, level: float, entry: float, atr: float,
+                                   sl_buffer_atr_mult: float = 0.3, min_stop_atr_mult: float = 0.5,
+                                   tp1_atr_mult: float = 1.5) -> dict:
+    """Computes SL/TP1 for liquidity-sweep and breakout-retest signals,
+    anchored to the swept/broken level but with a MINIMUM stop distance
+    from entry enforced. Without this floor: right after a sweep, entry
+    (the current price) can already be very close to the level, so a
+    purely level-anchored stop can end up tighter than realistic spread/
+    slippage -- making backtested wins look far more achievable than
+    they'd actually be in live trading. This affects both live signals and
+    the historical backtest identically, since both call this function."""
+    if direction == "bullish":
+        level_anchored_sl = level - sl_buffer_atr_mult * atr
+        min_sl = entry - min_stop_atr_mult * atr
+        sl = min(level_anchored_sl, min_sl)  # whichever is further from entry
+        tp1 = entry + tp1_atr_mult * atr
+    else:
+        level_anchored_sl = level + sl_buffer_atr_mult * atr
+        min_sl = entry + min_stop_atr_mult * atr
+        sl = max(level_anchored_sl, min_sl)
+        tp1 = entry - tp1_atr_mult * atr
+    return {"sl": sl, "tp1": tp1}
+
+
 def calculate_position_size(display_symbol: str, entry: float | None, sl: float | None) -> str | None:
     """Given the account size and risk % configured in config.py (or via
     ACCOUNT_SIZE_USD / RISK_PCT_PER_TRADE env vars), computes the position
@@ -482,8 +506,8 @@ def format_symbol_block(display_symbol: str, tf_data: dict, decision: dict, leve
         lines.append(f"{sw_emoji} Liquidity sweep: *{action_word}* -- swept {sweep['swept_level']:.5f} and rejected")
         entry = tf_data["15m"]["close"]
         atr15 = tf_data["15m"]["atr"]
-        sl = sweep["swept_level"] - 0.3 * atr15 if sweep["direction"] == "bullish" else sweep["swept_level"] + 0.3 * atr15
-        tp1 = entry + 1.5 * atr15 if sweep["direction"] == "bullish" else entry - 1.5 * atr15
+        sw_levels = compute_sweep_breakout_levels(sweep["direction"], sweep["swept_level"], entry, atr15)
+        sl, tp1 = sw_levels["sl"], sw_levels["tp1"]
         lines.append(f"  Entry {entry:.5f} | SL {sl:.5f} | TP1 {tp1:.5f}")
         size = calculate_position_size(display_symbol, entry, sl)
         if size:
@@ -495,8 +519,8 @@ def format_symbol_block(display_symbol: str, tf_data: dict, decision: dict, leve
         lines.append(f"{br_emoji} Breakout+retest: *{action_word}* -- level {breakout_retest['level']:.5f} held on retest")
         entry = tf_data["15m"]["close"]
         atr15 = tf_data["15m"]["atr"]
-        sl = breakout_retest["level"] - 0.3 * atr15 if breakout_retest["direction"] == "bullish" else breakout_retest["level"] + 0.3 * atr15
-        tp1 = entry + 1.5 * atr15 if breakout_retest["direction"] == "bullish" else entry - 1.5 * atr15
+        br_levels = compute_sweep_breakout_levels(breakout_retest["direction"], breakout_retest["level"], entry, atr15)
+        sl, tp1 = br_levels["sl"], br_levels["tp1"]
         lines.append(f"  Entry {entry:.5f} | SL {sl:.5f} | TP1 {tp1:.5f}")
         size = calculate_position_size(display_symbol, entry, sl)
         if size:
@@ -561,21 +585,19 @@ def analyze_symbol(symbol_cfg: dict) -> tuple[str, list[dict], bool]:
     if sweep:
         atr15 = tf_data["15m"]["atr"]
         entry = tf_data["15m"]["close"]
-        sl = sweep["swept_level"] - 0.3 * atr15 if sweep["direction"] == "bullish" else sweep["swept_level"] + 0.3 * atr15
-        tp1 = entry + 1.5 * atr15 if sweep["direction"] == "bullish" else entry - 1.5 * atr15
+        sw_levels = compute_sweep_breakout_levels(sweep["direction"], sweep["swept_level"], entry, atr15)
         actionable_signals.append({
             "symbol": display, "action": "LONG" if sweep["direction"] == "bullish" else "SHORT",
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None, "confidence": 60,
+            "entry": entry, "sl": sw_levels["sl"], "tp1": sw_levels["tp1"], "tp2": None, "confidence": 60,
             "details": f"swept {sweep['swept_level']:.5f}", "strategy_type": "liquidity_sweep",
         })
     if breakout_retest:
         atr15 = tf_data["15m"]["atr"]
         entry = tf_data["15m"]["close"]
-        sl = breakout_retest["level"] - 0.3 * atr15 if breakout_retest["direction"] == "bullish" else breakout_retest["level"] + 0.3 * atr15
-        tp1 = entry + 1.5 * atr15 if breakout_retest["direction"] == "bullish" else entry - 1.5 * atr15
+        br_levels = compute_sweep_breakout_levels(breakout_retest["direction"], breakout_retest["level"], entry, atr15)
         actionable_signals.append({
             "symbol": display, "action": "LONG" if breakout_retest["direction"] == "bullish" else "SHORT",
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None, "confidence": 60,
+            "entry": entry, "sl": br_levels["sl"], "tp1": br_levels["tp1"], "tp2": None, "confidence": 60,
             "details": f"retested {breakout_retest['level']:.5f}", "strategy_type": "breakout_retest",
         })
 
