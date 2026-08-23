@@ -2,23 +2,18 @@
 scalp bot against past price data, to see what it would have decided at
 each point in time -- without letting it "see" any future candles.
 
-Honest limitation, stated upfront: Twelve Data's free tier caps each
-request at 5,000 candles. For BTC's 5-minute data (which the live system
-also needs for entry timing), that's only about 17 days of history --
-the real bottleneck, since 4H/1H/15M data could go back much further on
-their own. This gives a genuine first sample, not a multi-month backtest.
+NEW: atr_timeframe lets you compute SL/TP width from a HIGHER timeframe's
+ATR (1h, 4h) instead of the tight 5-minute one the live bot uses by
+default. This exists because we found, with real data, that 5m-ATR-based
+stops are so tight that even a modest spread cost erases 30-70% of the
+entire risk unit -- every strategy type came back net negative after
+costs. Using a wider timeframe's ATR for the stop distance mechanically
+shrinks that cost's share of risk, at the cost of holding trades longer
+and getting fewer of them per day (which was explicitly requested: aiming
+for ~5 trades/day, not dozens).
 
-How look-ahead bias is avoided: at each replay timestamp, every timeframe's
-data is sliced to only include candles up to and including that exact
-timestamp -- never anything after it. This mirrors exactly what the live
-bot would have seen if it had actually been running at that moment.
-
-Every evaluated setup gets logged via db.save_evaluation() (source='backtest'),
-including NO TRADE ones -- not just the actionable signals -- so we can
-later ask whether the filtering is actually improving quality. Actionable
-signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
-within the SAME already-fetched historical data (no extra API calls needed
-for outcome-checking, since it's self-contained historical data).
+lookahead_hours is now configurable (default 24) since wider, swing-style
+stops can genuinely take days to resolve, not hours.
 """
 
 import asyncio
@@ -39,26 +34,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("historical_backtest")
 
-REPLAY_STEP_MINUTES = 30  # matches the live bot's actual scan cadence
-WARMUP_BARS = 250  # matches CANDLE_LIMIT used by the live indicators
-LOOKAHEAD_HOURS_FOR_OUTCOME = 24  # how far forward to check TP/SL within the historical data
+REPLAY_STEP_MINUTES = 30
+WARMUP_BARS = 250
+LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT = 24
 
 
 def fetch_full_history(api_symbol: str, interval: str, outputsize: int = 5000) -> pd.DataFrame | None:
-    """Like scalp_analysis.fetch_klines, but requests the maximum history
-    Twelve Data's free tier allows in one call, and keeps a proper parsed
-    'datetime' column for time-based slicing."""
     if not scalp_analysis.TWELVEDATA_API_KEY:
         return None
     try:
         r = requests.get(
             "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": api_symbol,
-                "interval": interval,
-                "outputsize": outputsize,
-                "apikey": scalp_analysis.TWELVEDATA_API_KEY,
-            },
+            params={"symbol": api_symbol, "interval": interval, "outputsize": outputsize, "apikey": scalp_analysis.TWELVEDATA_API_KEY},
             timeout=30,
         )
         r.raise_for_status()
@@ -80,9 +67,6 @@ def fetch_full_history(api_symbol: str, interval: str, outputsize: int = 5000) -
 
 
 def slice_up_to(df: pd.DataFrame, cutoff_dt, window: int = WARMUP_BARS) -> pd.DataFrame | None:
-    """Returns the most recent `window` candles at or before cutoff_dt --
-    never anything after it. Returns None if there isn't enough history yet
-    (still in the warmup period)."""
     sliced = df[df["datetime"] <= cutoff_dt]
     if len(sliced) < window:
         return None
@@ -91,30 +75,11 @@ def slice_up_to(df: pd.DataFrame, cutoff_dt, window: int = WARMUP_BARS) -> pd.Da
 
 def fetch_paginated_history(api_symbol: str, interval: str, target_start: datetime, target_end: datetime,
                              chunk_size: int = 5000, request_delay: float = 8.0, max_retries: int = 2) -> pd.DataFrame | None:
-    """Fetches a potentially long historical range by paginating backward
-    in chunk_size-candle requests, working around the free tier's
-    per-request cap. Stops early and returns whatever was collected if the
-    API runs out of data before reaching target_start -- Twelve Data's own
-    docs say intraday forex/crypto history can go back up to a year, but
-    that isn't confirmed for every symbol/interval on the free tier
-    specifically, so this discovers the REAL depth limit empirically
-    rather than assuming it. request_delay paces calls to stay under the
-    free tier's 8 requests/minute limit.
-
-    IMPORTANT: a single empty/error response does NOT necessarily mean the
-    real historical boundary was reached -- it can also be a transient
-    failure (rate-limit collision, momentary API hiccup). Confirmed by a
-    real case: a full-year XAU/USD fetch stopped after ~82 days, but a
-    later narrower request successfully pulled data from months earlier
-    that the first fetch never reached. To guard against silently
-    truncating good data, an empty/error response is retried up to
-    max_retries times (with a longer pause) before being treated as the
-    genuine depth limit."""
     if not scalp_analysis.TWELVEDATA_API_KEY:
         return None
     all_chunks = []
     current_end = target_end
-    max_iterations = 60  # raised alongside the retry logic below
+    max_iterations = 60
 
     for _ in range(max_iterations):
         if current_end <= target_start:
@@ -140,18 +105,18 @@ def fetch_paginated_history(api_symbol: str, interval: str, target_start: dateti
                 data = None
 
             if data is not None and data.get("status") != "error" and "values" in data and data["values"]:
-                break  # got real data, stop retrying
+                break
 
             if attempt < max_retries:
                 logger.info(
-                    "Empty/error response for %s %s ending %s -- retrying (attempt %d/%d) in case this was transient, not the real depth limit",
+                    "Empty/error response for %s %s ending %s -- retrying (attempt %d/%d)",
                     api_symbol, interval, current_end, attempt + 2, max_retries + 1,
                 )
-                time.sleep(request_delay * 2)  # longer pause before retrying
+                time.sleep(request_delay * 2)
 
         if data is None or data.get("status") == "error" or "values" not in data or not data["values"]:
             logger.info(
-                "No data for %s %s before %s after %d attempts -- treating as the real historical depth limit for this symbol/plan",
+                "No data for %s %s before %s after %d attempts -- treating as the real historical depth limit",
                 api_symbol, interval, current_end, max_retries + 1,
             )
             break
@@ -167,7 +132,7 @@ def fetch_paginated_history(api_symbol: str, interval: str, target_start: dateti
 
         earliest = chunk["datetime"].min()
         if earliest >= current_end:
-            break  # no progress -- avoid an infinite loop
+            break
         current_end = earliest - timedelta(seconds=1)
         time.sleep(request_delay)
 
@@ -178,11 +143,6 @@ def fetch_paginated_history(api_symbol: str, interval: str, target_start: dateti
 
 
 def compute_trade_levels_variant(action: str, entry: float, atr: float, sl_mult: float, tp1_mult: float, tp2_mult: float) -> dict:
-    """Like scalp_analysis.compute_trade_levels, but with configurable
-    SL/TP multipliers -- lets us A/B test different risk:reward ratios
-    against the same historical data without touching the live bot's
-    actual behavior (which stays fixed at 1.5/1.0/2.0 unless you decide
-    to adopt a different ratio permanently)."""
     if action == "LONG":
         return {"entry": entry, "sl": entry - sl_mult * atr, "tp1": entry + tp1_mult * atr, "tp2": entry + tp2_mult * atr}
     elif action == "SHORT":
@@ -190,12 +150,13 @@ def compute_trade_levels_variant(action: str, entry: float, atr: float, sl_mult:
     return {"entry": None, "sl": None, "tp1": None, "tp2": None}
 
 
-def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0) -> tuple[dict, dict, dict | None, str | None, dict | None, dict | None] | None:
-    """Runs the exact same indicator/decision logic as the live bot, but on
-    data sliced to only what would have been known at cutoff_dt. Returns
-    None if any timeframe doesn't have enough warmup data yet at this point.
-    sl_mult/tp1_mult/tp2_mult default to the live bot's actual ratios --
-    pass different values to test a variant."""
+def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0,
+                 atr_timeframe: str = "5m") -> tuple[dict, dict, dict | None, str | None, dict | None, dict | None] | None:
+    """atr_timeframe selects which timeframe's ATR sets the SL/TP distance
+    -- '5m' (the live bot's default, tight/scalp-style), '15m', '1h', or
+    '4h' (wider, swing-style, meant to survive real spread costs better).
+    Entry price is always the current 5m close regardless of which ATR is
+    used for sizing the stop -- only the WIDTH of SL/TP changes."""
     tf_data, dfs = {}, {}
     for label in ["4h", "1h", "15m", "5m"]:
         sliced = slice_up_to(dfs_full[label], cutoff_dt)
@@ -205,38 +166,26 @@ def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float
         dfs[label] = sliced
 
     divergence = scalp_analysis.detect_rsi_divergence(dfs["15m"])
-    decision = scalp_analysis.score_and_decide(tf_data, "neutral")  # no live news context available historically
+    decision = scalp_analysis.score_and_decide(tf_data, "neutral")
     range_setup = scalp_analysis.detect_range_setup(tf_data, dfs, divergence)
     sweep = scalp_analysis.detect_liquidity_sweep(dfs["15m"], tf_data["15m"]["atr"])
     breakout_retest = scalp_analysis.detect_breakout_retest(dfs["15m"], tf_data["15m"]["atr"])
 
     entry_price = tf_data["5m"]["close"]
-    atr_5m = tf_data["5m"]["atr"]
-    levels = compute_trade_levels_variant(decision["action"], entry_price, atr_5m, sl_mult, tp1_mult, tp2_mult)
+    atr_for_sizing = tf_data[atr_timeframe]["atr"]
+    levels = compute_trade_levels_variant(decision["action"], entry_price, atr_for_sizing, sl_mult, tp1_mult, tp2_mult)
 
     return tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest
 
 
 def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl: float,
-                           tp1: float, tp2: float | None, action: str) -> dict:
-    """Tracks the ACTUAL trade outcome (unchanged from before -- closes at
-    TP1/SL/expiry, exactly as it always has) but now separates MAE/MFE into
-    two distinct phases:
-
-    - mae_before_tp1_r / mfe_before_tp1_r: excursion strictly BEFORE TP1 is
-      touched. Answers "how efficiently/roughly does the trade get there."
-    - mfe_after_tp1_r / max_giveback_after_tp1_r / tp2_hit / returned_to_entry_after_tp1:
-      RESEARCH-ONLY continued observation of what price did AFTER the real
-      exit already happened at TP1. This does NOT change the recorded
-      outcome/r_multiple above -- the trade already closed. It answers a
-      different question: "if we'd held longer, what would have happened,"
-      which is useful for deciding whether TP1 leaves value on the table,
-      but must never be conflated with what was actually captured.
-
-    If TP1 is never reached, all after-TP1 fields are None (not zero) --
-    the question "what happens after TP1" doesn't apply to that trade.
-    """
-    window_end = entry_time + timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)
+                           tp1: float, tp2: float | None, action: str,
+                           lookahead_hours: float = LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT) -> dict:
+    """Same WIN/LOSS/EXPIRED/MAE/MFE logic as before. lookahead_hours is now
+    a parameter (not a fixed global) since wider, swing-style stops can
+    genuinely take days to resolve, not hours -- a 24-hour window would
+    incorrectly mark many genuinely-still-open swing trades as EXPIRED."""
+    window_end = entry_time + timedelta(hours=lookahead_hours)
     forward = df_5m_full[(df_5m_full["datetime"] > entry_time) & (df_5m_full["datetime"] <= window_end)].reset_index(drop=True)
     risk = abs(entry - sl)
 
@@ -265,8 +214,7 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
                 tp1_hit, tp1_hit_time, tp1_row_idx = True, c["datetime"], i
                 profit = (tp1 - entry) if action == "LONG" else (entry - tp1)
                 outcome, exit_price, r_multiple = "WIN", tp1, (profit / risk if risk else 0.0)
-                exit_time = c["datetime"]  # the real exit -- continued observation below is research-only
-                # deliberately do NOT break -- continue below for research only
+                exit_time = c["datetime"]
 
     if outcome is None:
         last_row = forward.iloc[-1] if len(forward) else None
@@ -324,19 +272,7 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
 def process_signal_type(strategy_type: str, action: str | None, entry: float | None, sl: float | None,
                          tp1: float | None, tp2: float | None, confidence: float, details: str,
                          t: datetime, dfs_full: dict, tracker: dict, result_symbol: str,
-                         log_no_signal: bool = False) -> str:
-    """Handles ONE strategy type's signal for this replay step: continuation
-    detection, logging, and outcome evaluation, using its OWN independent
-    open-trade tracker -- a persisting range trade doesn't block a fresh
-    liquidity sweep from counting, and vice versa, since each strategy type
-    tracks its own "is this still the same open trade" state separately.
-
-    log_no_signal controls whether an explicit NO TRADE row gets logged
-    when there's no signal this step -- only 'trend' does this (matching
-    the live bot, which only ever logs a NO TRADE row for its primary
-    trend decision, not for the absence of a range/sweep/breakout signal).
-
-    Returns one of: 'new', 'continuation', 'no_trade', 'absent'."""
+                         log_no_signal: bool = False, lookahead_hours: float = LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT) -> str:
     if action is None:
         if log_no_signal:
             db.save_evaluation(
@@ -360,7 +296,7 @@ def process_signal_type(strategy_type: str, action: str | None, entry: float | N
         confidence=confidence, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
         details=details, evaluated_at=t.isoformat(),
     )
-    detail = find_outcome_detailed(dfs_full["5m"], t, entry, sl, tp1, tp2, action)
+    detail = find_outcome_detailed(dfs_full["5m"], t, entry, sl, tp1, tp2, action, lookahead_hours=lookahead_hours)
     db.save_backtest_outcome(
         eval_id, detail["outcome"], detail["exit_price"], detail["r_multiple"],
         mae_r=detail["mae_before_tp1_r"], mfe_r=detail["mfe_before_tp1_r"],
@@ -377,16 +313,20 @@ def process_signal_type(strategy_type: str, action: str | None, entry: float | N
 
 async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
               sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0,
-              deep_start_date: str | None = None, deep_end_date: str | None = None):
-    """deep_start_date/deep_end_date (format YYYY-MM-DD) switch to paginated
-    fetching for a much longer historical window (e.g. all of 2025) instead
-    of the default quick ~17-day fetch. This uses many more API requests
-    and takes considerably longer to replay -- see the workflow's own
-    warning about credit usage before running this during active hours."""
-    # Tag variant runs distinctly so they never mix with the baseline
-    # results already in the database for this symbol
+              deep_start_date: str | None = None, deep_end_date: str | None = None,
+              atr_timeframe: str = "5m", lookahead_hours: float | None = None):
+    """atr_timeframe: '5m' (live bot default) / '15m' / '1h' / '4h' -- which
+    timeframe's ATR sets the SL/TP width. lookahead_hours: how long to wait
+    for TP/SL before marking EXPIRED -- defaults to 24h for 5m/15m, but
+    auto-extends to 168h (7 days) for 1h/4h unless you override it, since
+    wider stops genuinely take longer to resolve."""
+    if lookahead_hours is None:
+        lookahead_hours = 168.0 if atr_timeframe in ("1h", "4h") else LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT
+
     is_variant = (sl_mult, tp1_mult, tp2_mult) != (1.5, 1.0, 2.0)
     result_symbol = f"{display_symbol} (R:R {tp1_mult:.1f}:{sl_mult:.1f})" if is_variant else display_symbol
+    if atr_timeframe != "5m":
+        result_symbol = f"{result_symbol} [{atr_timeframe}-ATR]"
     if deep_start_date and deep_end_date:
         result_symbol = f"{result_symbol} [{deep_start_date} to {deep_end_date}]"
 
@@ -415,19 +355,17 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             dfs_full[label] = df
             logger.info("%s: %d candles, from %s to %s", label, len(df), df["datetime"].min(), df["datetime"].max())
 
-    # Bound the replay window to whatever timeframe has the least history
-    # (in practice, 5-minute data, given the free-tier candle-count cap)
     earliest_start = max(df["datetime"].min() for df in dfs_full.values())
     latest_end = min(df["datetime"].max() for df in dfs_full.values())
-    replay_start = earliest_start + timedelta(minutes=WARMUP_BARS * 5)  # ensure warmup for the finest timeframe
-    replay_end = latest_end - timedelta(hours=LOOKAHEAD_HOURS_FOR_OUTCOME)  # leave room to check outcomes
+    replay_start = earliest_start + timedelta(minutes=WARMUP_BARS * 5)
+    replay_end = latest_end - timedelta(hours=lookahead_hours)
 
     if replay_start >= replay_end:
         logger.error("Not enough historical range to replay after accounting for warmup and outcome lookahead")
         return
 
-    logger.info("Replaying from %s to %s in %d-minute steps (SL=%.1fx TP1=%.1fx TP2=%.1fx ATR)",
-                replay_start, replay_end, REPLAY_STEP_MINUTES, sl_mult, tp1_mult, tp2_mult)
+    logger.info("Replaying from %s to %s in %d-minute steps (SL=%.1fx TP1=%.1fx TP2=%.1fx %s-ATR, lookahead=%.0fh)",
+                replay_start, replay_end, REPLAY_STEP_MINUTES, sl_mult, tp1_mult, tp2_mult, atr_timeframe, lookahead_hours)
 
     step = timedelta(minutes=REPLAY_STEP_MINUTES)
     t = replay_start
@@ -436,7 +374,7 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
     open_trades = {st: {"direction": None, "exit_time": None} for st in STRATEGY_TYPES}
 
     while t <= replay_end:
-        result = evaluate_at(t, dfs_full, sl_mult, tp1_mult, tp2_mult)
+        result = evaluate_at(t, dfs_full, sl_mult, tp1_mult, tp2_mult, atr_timeframe=atr_timeframe)
         if result is None:
             t += step
             continue
@@ -444,13 +382,11 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
         tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest = result
         htf_details = f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']}"
 
-        # Trend -- the only type that logs an explicit NO TRADE row every
-        # step, matching the live bot's behavior (used for total_evaluated
-        # bookkeeping across the whole symbol)
         trend_action = decision["action"] if decision["action"] != "NO TRADE" else None
         status = process_signal_type(
             "trend", trend_action, levels.get("entry"), levels.get("sl"), levels.get("tp1"), levels.get("tp2"),
-            decision["confidence"], htf_details, t, dfs_full, open_trades["trend"], result_symbol, log_no_signal=True,
+            decision["confidence"], htf_details, t, dfs_full, open_trades["trend"], result_symbol,
+            log_no_signal=True, lookahead_hours=lookahead_hours,
         )
         if status in ("new", "no_trade"):
             totals["evaluated"] += 1
@@ -459,7 +395,10 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
         elif status == "continuation":
             totals["continuations"] += 1
 
-        # Range
+        # Range/sweep/breakout still use their own SL logic (level-anchored,
+        # not the chosen atr_timeframe) -- multi-timeframe stop testing is
+        # scoped to trend here, since that's the one strategy with any
+        # real evidence behind it worth testing further
         if range_setup:
             r_action, r_entry, r_sl, r_tp1, r_details = (
                 range_setup["direction"], range_setup["entry"], range_setup["sl"], range_setup["tp"], range_setup["reason"],
@@ -469,7 +408,7 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             r_details = ""
         status = process_signal_type(
             "range", r_action, r_entry, r_sl, r_tp1, None, 60, r_details,
-            t, dfs_full, open_trades["range"], result_symbol,
+            t, dfs_full, open_trades["range"], result_symbol, lookahead_hours=lookahead_hours,
         )
         if status == "new":
             totals["evaluated"] += 1
@@ -477,7 +416,6 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
         elif status == "continuation":
             totals["continuations"] += 1
 
-        # Liquidity sweep
         if sweep:
             atr15 = tf_data["15m"]["atr"]
             sweep_entry = tf_data["15m"]["close"]
@@ -490,7 +428,7 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             sw_details = ""
         status = process_signal_type(
             "liquidity_sweep", sw_action, sweep_entry, sw_sl, sw_tp1, None, 60, sw_details,
-            t, dfs_full, open_trades["liquidity_sweep"], result_symbol,
+            t, dfs_full, open_trades["liquidity_sweep"], result_symbol, lookahead_hours=lookahead_hours,
         )
         if status == "new":
             totals["evaluated"] += 1
@@ -498,7 +436,6 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
         elif status == "continuation":
             totals["continuations"] += 1
 
-        # Breakout + retest
         if breakout_retest:
             atr15 = tf_data["15m"]["atr"]
             br_entry = tf_data["15m"]["close"]
@@ -511,7 +448,7 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             br_details = ""
         status = process_signal_type(
             "breakout_retest", br_action, br_entry, br_sl, br_tp1, None, 60, br_details,
-            t, dfs_full, open_trades["breakout_retest"], result_symbol,
+            t, dfs_full, open_trades["breakout_retest"], result_symbol, lookahead_hours=lookahead_hours,
         )
         if status == "new":
             totals["evaluated"] += 1
@@ -524,11 +461,13 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
     logger.info("Backtest complete: %d evaluated, %d actionable, %d continuations skipped",
                 totals["evaluated"], totals["actionable"], totals["continuations"])
 
+    days_in_period = max((replay_end - replay_start).total_seconds() / 86400, 1e-9)
+
     summary = db.get_backtest_summary(result_symbol)
     strategy_stats = db.get_backtest_strategy_type_stats(result_symbol)
 
     lines = [f"*📈 Historical Backtest: {result_symbol}*\n"]
-    lines.append(f"Period: {replay_start.strftime('%Y-%m-%d')} to {replay_end.strftime('%Y-%m-%d')} ({REPLAY_STEP_MINUTES}-min steps)")
+    lines.append(f"Period: {replay_start.strftime('%Y-%m-%d')} to {replay_end.strftime('%Y-%m-%d')} ({REPLAY_STEP_MINUTES}-min steps, {atr_timeframe}-ATR sizing)")
     lines.append(f"Total evaluated: {summary['total_evaluated']} ({summary['no_trade_count']} NO TRADE, {summary['actionable_count']} actionable)")
     if summary["win_rate"] is not None:
         pf = f"{summary['profit_factor']:.2f}" if summary["profit_factor"] is not None else "N/A"
@@ -542,12 +481,13 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
 
     if strategy_stats:
         lines.append("")
-        lines.append("_By strategy type -- which detection engine actually produces expectancy:_")
+        lines.append("_By strategy type (trades/day shown for the trend row, since only that one uses the wider stop):_")
         for s in strategy_stats:
             if s["win_rate"] is not None:
                 pf = f"{s['profit_factor']:.2f}" if s["profit_factor"] is not None else "N/A"
+                trades_per_day_str = f", {s['trades']/days_in_period:.1f} trades/day" if s["strategy_type"] == "trend" else ""
                 lines.append(
-                    f"*{s['strategy_type']}* (n={s['trades']}): {s['wins']}W/{s['losses']}L ({s['win_rate']*100:.0f}%), "
+                    f"*{s['strategy_type']}* (n={s['trades']}{trades_per_day_str}): {s['wins']}W/{s['losses']}L ({s['win_rate']*100:.0f}%), "
                     f"avg R {s['avg_r']:+.2f}, PF {pf}, max DD {s['max_drawdown_r']:.2f}R"
                     + (f", {s['expired']} expired" if s["expired"] else "")
                 )
@@ -557,13 +497,10 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
     lines.append("")
     if deep_start_date and deep_end_date:
         lines.append(
-            f"_Deep backtest requested {deep_start_date} to {deep_end_date}. Actual achieved range shown above -- "
-            f"if it's shorter than requested, that's the real historical depth limit for this symbol on the free tier, "
-            f"discovered by the fetch itself rather than assumed. Still a single historical window, not out-of-sample "
-            f"validation._"
+            f"_Deep backtest requested {deep_start_date} to {deep_end_date}. Actual achieved range shown above._"
         )
     else:
-        lines.append("_Limited to ~17 days of 5-minute history (free-tier cap). Small sample -- a starting point, not proof of an edge._")
+        lines.append("_Limited to ~17 days of 5-minute history (free-tier cap)._")
 
     await telegram_bot.send_text("\n".join(lines))
     logger.info("Sent backtest summary")
