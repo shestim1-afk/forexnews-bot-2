@@ -642,7 +642,8 @@ async def run():
             )
             status_emoji = "✅" if allowed else "⛔"
             status_text = "would be taken" if allowed else f"SKIPPED -- {reason}"
-            risk_lines.append(f"{status_emoji} {sig['strategy_type']}: {status_text}")
+            evidence = db.get_strategy_evidence_label(symbol_cfg["api"], sig["strategy_type"])
+            risk_lines.append(f"{status_emoji} {sig['strategy_type']}: {status_text}\n   {evidence}")
 
         if actionable:
             if risk_lines:
