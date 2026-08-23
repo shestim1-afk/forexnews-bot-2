@@ -19,6 +19,12 @@ later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
 for outcome-checking, since it's self-contained historical data).
+
+All four detection engines (trend, range, liquidity_sweep, breakout_retest)
+are independently tracked and scored, each with its own continuation
+tracking -- so a persisting range trade doesn't block a fresh liquidity
+sweep from counting, and vice versa. This lets us directly compare which
+approach actually produces expectancy, not just guess.
 """
 
 import asyncio
@@ -297,6 +303,60 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
     return result
 
 
+def process_signal_type(strategy_type: str, action: str | None, entry: float | None, sl: float | None,
+                         tp1: float | None, tp2: float | None, confidence: float, details: str,
+                         t: datetime, dfs_full: dict, tracker: dict, result_symbol: str,
+                         log_no_signal: bool = False) -> str:
+    """Handles ONE strategy type's signal for this replay step: continuation
+    detection, logging, and outcome evaluation, using its OWN independent
+    open-trade tracker -- a persisting range trade doesn't block a fresh
+    liquidity sweep from counting, and vice versa, since each strategy type
+    tracks its own "is this still the same open trade" state separately.
+
+    log_no_signal controls whether an explicit NO TRADE row gets logged
+    when there's no signal this step -- only 'trend' does this (matching
+    the live bot, which only ever logs a NO TRADE row for its primary
+    trend decision, not for the absence of a range/sweep/breakout signal).
+
+    Returns one of: 'new', 'continuation', 'no_trade', 'absent'."""
+    if action is None:
+        if log_no_signal:
+            db.save_evaluation(
+                source="backtest", symbol=result_symbol, strategy_type=strategy_type, action="NO TRADE",
+                confidence=confidence, entry=None, sl=None, tp1=None, tp2=None,
+                details=details, evaluated_at=t.isoformat(),
+            )
+        tracker["direction"], tracker["exit_time"] = None, None
+        return "no_trade" if log_no_signal else "absent"
+
+    is_continuation = (
+        tracker["direction"] == action
+        and tracker["exit_time"] is not None
+        and t <= tracker["exit_time"]
+    )
+    if is_continuation:
+        return "continuation"
+
+    eval_id = db.save_evaluation(
+        source="backtest", symbol=result_symbol, strategy_type=strategy_type, action=action,
+        confidence=confidence, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+        details=details, evaluated_at=t.isoformat(),
+    )
+    detail = find_outcome_detailed(dfs_full["5m"], t, entry, sl, tp1, tp2, action)
+    db.save_backtest_outcome(
+        eval_id, detail["outcome"], detail["exit_price"], detail["r_multiple"],
+        mae_r=detail["mae_before_tp1_r"], mfe_r=detail["mfe_before_tp1_r"],
+        mae_before_tp1_r=detail["mae_before_tp1_r"], mfe_before_tp1_r=detail["mfe_before_tp1_r"],
+        tp1_hit=detail["tp1_hit"], tp2_hit=detail["tp2_hit"],
+        time_to_tp1_minutes=detail["time_to_tp1_minutes"], time_to_tp2_minutes=detail["time_to_tp2_minutes"],
+        mfe_after_tp1_r=detail["mfe_after_tp1_r"], max_giveback_after_tp1_r=detail["max_giveback_after_tp1_r"],
+        returned_to_entry_after_tp1=detail["returned_to_entry_after_tp1"], time_to_exit_minutes=detail["time_to_exit_minutes"],
+    )
+    tracker["direction"] = action
+    tracker["exit_time"] = detail["exit_time"]
+    return "new"
+
+
 async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
               sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0,
               deep_start_date: str | None = None, deep_end_date: str | None = None):
@@ -353,11 +413,9 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
 
     step = timedelta(minutes=REPLAY_STEP_MINUTES)
     t = replay_start
-    evaluated_count = 0
-    actionable_count = 0
-    continuation_count = 0
-    open_direction = None
-    open_exit_time = None
+    totals = {"evaluated": 0, "actionable": 0, "continuations": 0}
+    STRATEGY_TYPES = ["trend", "range", "liquidity_sweep", "breakout_retest"]
+    open_trades = {st: {"direction": None, "exit_time": None} for st in STRATEGY_TYPES}
 
     while t <= replay_end:
         result = evaluate_at(t, dfs_full, sl_mult, tp1_mult, tp2_mult)
@@ -366,72 +424,118 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
             continue
 
         tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest = result
+        htf_details = f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']}"
 
-        if decision["action"] == "NO TRADE":
-            db.save_evaluation(
-                source="backtest", symbol=result_symbol, strategy_type="trend", action="NO TRADE",
-                confidence=decision["confidence"], entry=None, sl=None, tp1=None, tp2=None,
-                details=f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']}",
-                evaluated_at=t.isoformat(),
+        # Trend -- the only type that logs an explicit NO TRADE row every
+        # step, matching the live bot's behavior (used for total_evaluated
+        # bookkeeping across the whole symbol)
+        trend_action = decision["action"] if decision["action"] != "NO TRADE" else None
+        status = process_signal_type(
+            "trend", trend_action, levels.get("entry"), levels.get("sl"), levels.get("tp1"), levels.get("tp2"),
+            decision["confidence"], htf_details, t, dfs_full, open_trades["trend"], result_symbol, log_no_signal=True,
+        )
+        if status in ("new", "no_trade"):
+            totals["evaluated"] += 1
+        if status == "new":
+            totals["actionable"] += 1
+        elif status == "continuation":
+            totals["continuations"] += 1
+
+        # Range
+        if range_setup:
+            r_action, r_entry, r_sl, r_tp1, r_details = (
+                range_setup["direction"], range_setup["entry"], range_setup["sl"], range_setup["tp"], range_setup["reason"],
             )
-            evaluated_count += 1
-            open_direction, open_exit_time = None, None
-            t += step
-            continue
-
-        is_continuation = (
-            open_direction == decision["action"]
-            and open_exit_time is not None
-            and t <= open_exit_time
+        else:
+            r_action = r_entry = r_sl = r_tp1 = None
+            r_details = ""
+        status = process_signal_type(
+            "range", r_action, r_entry, r_sl, r_tp1, None, 60, r_details,
+            t, dfs_full, open_trades["range"], result_symbol,
         )
-        if is_continuation:
-            continuation_count += 1
-            t += step
-            continue
+        if status == "new":
+            totals["evaluated"] += 1
+            totals["actionable"] += 1
+        elif status == "continuation":
+            totals["continuations"] += 1
 
-        eval_id = db.save_evaluation(
-            source="backtest", symbol=result_symbol, strategy_type="trend", action=decision["action"],
-            confidence=decision["confidence"], entry=levels["entry"], sl=levels["sl"],
-            tp1=levels["tp1"], tp2=levels["tp2"],
-            details=f"4h={tf_data['4h']['trend']} 1h={tf_data['1h']['trend']} 15m={tf_data['15m']['trend']} 5m={tf_data['5m']['trend']}",
-            evaluated_at=t.isoformat(),
+        # Liquidity sweep
+        if sweep:
+            atr15 = tf_data["15m"]["atr"]
+            sweep_entry = tf_data["15m"]["close"]
+            sw_action = "LONG" if sweep["direction"] == "bullish" else "SHORT"
+            sw_levels = scalp_analysis.compute_sweep_breakout_levels(sweep["direction"], sweep["swept_level"], sweep_entry, atr15)
+            sw_sl, sw_tp1 = sw_levels["sl"], sw_levels["tp1"]
+            sw_details = f"swept {sweep['swept_level']:.5f}"
+        else:
+            sw_action = sweep_entry = sw_sl = sw_tp1 = None
+            sw_details = ""
+        status = process_signal_type(
+            "liquidity_sweep", sw_action, sweep_entry, sw_sl, sw_tp1, None, 60, sw_details,
+            t, dfs_full, open_trades["liquidity_sweep"], result_symbol,
         )
-        evaluated_count += 1
-        actionable_count += 1
+        if status == "new":
+            totals["evaluated"] += 1
+            totals["actionable"] += 1
+        elif status == "continuation":
+            totals["continuations"] += 1
 
-        detail = find_outcome_detailed(
-            dfs_full["5m"], t, levels["entry"], levels["sl"], levels["tp1"], levels["tp2"], decision["action"]
+        # Breakout + retest
+        if breakout_retest:
+            atr15 = tf_data["15m"]["atr"]
+            br_entry = tf_data["15m"]["close"]
+            br_action = "LONG" if breakout_retest["direction"] == "bullish" else "SHORT"
+            br_levels = scalp_analysis.compute_sweep_breakout_levels(breakout_retest["direction"], breakout_retest["level"], br_entry, atr15)
+            br_sl, br_tp1 = br_levels["sl"], br_levels["tp1"]
+            br_details = f"retested {breakout_retest['level']:.5f}"
+        else:
+            br_action = br_entry = br_sl = br_tp1 = None
+            br_details = ""
+        status = process_signal_type(
+            "breakout_retest", br_action, br_entry, br_sl, br_tp1, None, 60, br_details,
+            t, dfs_full, open_trades["breakout_retest"], result_symbol,
         )
-        db.save_backtest_outcome(
-            eval_id, detail["outcome"], detail["exit_price"], detail["r_multiple"],
-            mae_r=detail["mae_before_tp1_r"], mfe_r=detail["mfe_before_tp1_r"],
-            mae_before_tp1_r=detail["mae_before_tp1_r"], mfe_before_tp1_r=detail["mfe_before_tp1_r"],
-            tp1_hit=detail["tp1_hit"], tp2_hit=detail["tp2_hit"],
-            time_to_tp1_minutes=detail["time_to_tp1_minutes"], time_to_tp2_minutes=detail["time_to_tp2_minutes"],
-            mfe_after_tp1_r=detail["mfe_after_tp1_r"], max_giveback_after_tp1_r=detail["max_giveback_after_tp1_r"],
-            returned_to_entry_after_tp1=detail["returned_to_entry_after_tp1"], time_to_exit_minutes=detail["time_to_exit_minutes"],
-        )
-
-        open_direction = decision["action"]
-        open_exit_time = detail["exit_time"]
+        if status == "new":
+            totals["evaluated"] += 1
+            totals["actionable"] += 1
+        elif status == "continuation":
+            totals["continuations"] += 1
 
         t += step
 
-    logger.info("Backtest complete: %d evaluated, %d actionable, %d continuations skipped", evaluated_count, actionable_count, continuation_count)
+    logger.info("Backtest complete: %d evaluated, %d actionable, %d continuations skipped",
+                totals["evaluated"], totals["actionable"], totals["continuations"])
 
     summary = db.get_backtest_summary(result_symbol)
+    strategy_stats = db.get_backtest_strategy_type_stats(result_symbol)
+
     lines = [f"*📈 Historical Backtest: {result_symbol}*\n"]
     lines.append(f"Period: {replay_start.strftime('%Y-%m-%d')} to {replay_end.strftime('%Y-%m-%d')} ({REPLAY_STEP_MINUTES}-min steps)")
     lines.append(f"Total evaluated: {summary['total_evaluated']} ({summary['no_trade_count']} NO TRADE, {summary['actionable_count']} actionable)")
     if summary["win_rate"] is not None:
         pf = f"{summary['profit_factor']:.2f}" if summary["profit_factor"] is not None else "N/A"
         lines.append(
-            f"Resolved: {summary['wins']}W / {summary['losses']}L ({summary['win_rate']*100:.0f}% win rate), "
+            f"Overall: {summary['wins']}W / {summary['losses']}L ({summary['win_rate']*100:.0f}% win rate), "
             f"avg R: {summary['avg_r']:+.2f}, profit factor: {pf}, max drawdown: {summary['max_drawdown_r']:.2f}R"
             + (f", {summary['expired']} expired" if summary["expired"] else "")
         )
     else:
         lines.append("No actionable signals resolved in this window.")
+
+    if strategy_stats:
+        lines.append("")
+        lines.append("_By strategy type -- which detection engine actually produces expectancy:_")
+        for s in strategy_stats:
+            if s["win_rate"] is not None:
+                pf = f"{s['profit_factor']:.2f}" if s["profit_factor"] is not None else "N/A"
+                lines.append(
+                    f"*{s['strategy_type']}* (n={s['trades']}): {s['wins']}W/{s['losses']}L ({s['win_rate']*100:.0f}%), "
+                    f"avg R {s['avg_r']:+.2f}, PF {pf}, max DD {s['max_drawdown_r']:.2f}R"
+                    + (f", {s['expired']} expired" if s["expired"] else "")
+                )
+            else:
+                lines.append(f"*{s['strategy_type']}*: no resolved trades yet")
+
     lines.append("")
     if deep_start_date and deep_end_date:
         lines.append(
