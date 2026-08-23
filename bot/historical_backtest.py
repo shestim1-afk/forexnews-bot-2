@@ -19,12 +19,6 @@ later ask whether the filtering is actually improving quality. Actionable
 signals get their outcome (WIN/LOSS/EXPIRED) determined by scanning forward
 within the SAME already-fetched historical data (no extra API calls needed
 for outcome-checking, since it's self-contained historical data).
-
-All four detection engines (trend, range, liquidity_sweep, breakout_retest)
-are independently tracked and scored, each with its own continuation
-tracking -- so a persisting range trade doesn't block a fresh liquidity
-sweep from counting, and vice versa. This lets us directly compare which
-approach actually produces expectancy, not just guess.
 """
 
 import asyncio
@@ -96,7 +90,7 @@ def slice_up_to(df: pd.DataFrame, cutoff_dt, window: int = WARMUP_BARS) -> pd.Da
 
 
 def fetch_paginated_history(api_symbol: str, interval: str, target_start: datetime, target_end: datetime,
-                             chunk_size: int = 5000, request_delay: float = 8.0) -> pd.DataFrame | None:
+                             chunk_size: int = 5000, request_delay: float = 8.0, max_retries: int = 2) -> pd.DataFrame | None:
     """Fetches a potentially long historical range by paginating backward
     in chunk_size-candle requests, working around the free tier's
     per-request cap. Stops early and returns whatever was collected if the
@@ -105,36 +99,60 @@ def fetch_paginated_history(api_symbol: str, interval: str, target_start: dateti
     that isn't confirmed for every symbol/interval on the free tier
     specifically, so this discovers the REAL depth limit empirically
     rather than assuming it. request_delay paces calls to stay under the
-    free tier's 8 requests/minute limit."""
+    free tier's 8 requests/minute limit.
+
+    IMPORTANT: a single empty/error response does NOT necessarily mean the
+    real historical boundary was reached -- it can also be a transient
+    failure (rate-limit collision, momentary API hiccup). Confirmed by a
+    real case: a full-year XAU/USD fetch stopped after ~82 days, but a
+    later narrower request successfully pulled data from months earlier
+    that the first fetch never reached. To guard against silently
+    truncating good data, an empty/error response is retried up to
+    max_retries times (with a longer pause) before being treated as the
+    genuine depth limit."""
     if not scalp_analysis.TWELVEDATA_API_KEY:
         return None
     all_chunks = []
     current_end = target_end
-    max_iterations = 40  # safety cap -- comfortably more than a full year needs at any interval here
+    max_iterations = 60  # raised alongside the retry logic below
 
     for _ in range(max_iterations):
         if current_end <= target_start:
             break
-        try:
-            r = requests.get(
-                "https://api.twelvedata.com/time_series",
-                params={
-                    "symbol": api_symbol, "interval": interval, "outputsize": chunk_size,
-                    "end_date": current_end.strftime("%Y-%m-%d %H:%M:%S"),
-                    "apikey": scalp_analysis.TWELVEDATA_API_KEY,
-                },
-                timeout=30,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            logger.warning("Failed to fetch chunk for %s %s ending %s: %s", api_symbol, interval, current_end, e)
-            break
 
-        if data.get("status") == "error" or "values" not in data or not data["values"]:
+        data = None
+        for attempt in range(max_retries + 1):
+            try:
+                r = requests.get(
+                    "https://api.twelvedata.com/time_series",
+                    params={
+                        "symbol": api_symbol, "interval": interval, "outputsize": chunk_size,
+                        "end_date": current_end.strftime("%Y-%m-%d %H:%M:%S"),
+                        "apikey": scalp_analysis.TWELVEDATA_API_KEY,
+                    },
+                    timeout=30,
+                )
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                logger.warning("Failed to fetch chunk for %s %s ending %s (attempt %d/%d): %s",
+                                api_symbol, interval, current_end, attempt + 1, max_retries + 1, e)
+                data = None
+
+            if data is not None and data.get("status") != "error" and "values" in data and data["values"]:
+                break  # got real data, stop retrying
+
+            if attempt < max_retries:
+                logger.info(
+                    "Empty/error response for %s %s ending %s -- retrying (attempt %d/%d) in case this was transient, not the real depth limit",
+                    api_symbol, interval, current_end, attempt + 2, max_retries + 1,
+                )
+                time.sleep(request_delay * 2)  # longer pause before retrying
+
+        if data is None or data.get("status") == "error" or "values" not in data or not data["values"]:
             logger.info(
-                "No more data available for %s %s before %s -- likely the real historical depth limit for this symbol/plan",
-                api_symbol, interval, current_end,
+                "No data for %s %s before %s after %d attempts -- treating as the real historical depth limit for this symbol/plan",
+                api_symbol, interval, current_end, max_retries + 1,
             )
             break
 
