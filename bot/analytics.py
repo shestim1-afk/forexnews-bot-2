@@ -248,5 +248,135 @@ async def run_excursion_report(symbols: list[str] | None = None, strategy_types:
     logger.info("Sent excursion report")
 
 
+# Round-trip spread cost estimates, as a % of price -- ROUGH STARTING POINTS,
+# not guaranteed figures. Real costs vary significantly by broker/exchange;
+# override with your own actual spread if you know it, for a meaningful answer.
+DEFAULT_SPREAD_PCT = {
+    "BTC/USD": 0.05,
+    "XAU/USD": 0.03,
+    "GBP/JPY": 0.02,
+}
+
+
+def get_raw_stats_for_symbol_prefix(api_symbol: str, strategy_type: str) -> dict | None:
+    """Same prefix-matching as get_cost_adjusted_stats (to correctly find
+    deep-backtest data tagged with a date-range suffix), computing the
+    UN-adjusted baseline stats for direct before/after comparison."""
+    conn = db._connect()
+    try:
+        rows = conn.execute(
+            """SELECT o.outcome, o.r_multiple
+               FROM backtest_outcomes o
+               JOIN all_evaluations e ON e.id = o.evaluation_id
+               WHERE e.source='backtest' AND e.strategy_type=?
+                 AND e.symbol LIKE ? AND e.symbol NOT LIKE '%(R:R%'
+                 AND o.outcome IN ('WIN', 'LOSS')""",
+            (strategy_type, f"{api_symbol}%"),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    n = len(rows)
+    if n == 0:
+        return None
+    r_seq = [r for _, r in rows]
+    avg_r = sum(r_seq) / n
+    gains = sum(r for r in r_seq if r > 0)
+    loss_sum = abs(sum(r for r in r_seq if r < 0))
+    pf = gains / loss_sum if loss_sum > 0 else None
+    return {"n": n, "avg_r": avg_r, "profit_factor": pf}
+
+
+def get_cost_adjusted_stats(api_symbol: str, strategy_type: str, spread_pct: float | None = None) -> dict | None:
+    """Recomputes win/loss/PF using each trade's OWN real stored entry/SL
+    distance (not an estimate) to convert an assumed spread cost into an
+    R-multiple, then subtracts that from every trade's realized R --
+    winners get smaller, losers get worse, and a trade close to breakeven
+    can flip from a nominal win to a real loss once costs are included.
+    This is the honest question the raw backtest numbers never answer:
+    does the edge survive contact with real execution costs?"""
+    spread_pct = spread_pct if spread_pct is not None else DEFAULT_SPREAD_PCT.get(api_symbol, 0.05)
+    conn = db._connect()
+    try:
+        rows = conn.execute(
+            """SELECT e.entry, e.sl, o.r_multiple
+               FROM backtest_outcomes o
+               JOIN all_evaluations e ON e.id = o.evaluation_id
+               WHERE e.source='backtest' AND e.strategy_type=?
+                 AND e.symbol LIKE ? AND e.symbol NOT LIKE '%(R:R%'
+                 AND o.outcome IN ('WIN', 'LOSS')""",
+            (strategy_type, f"{api_symbol}%"),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    adjusted_r_seq, cost_r_seq = [], []
+    for entry, sl, r in rows:
+        if entry is None or sl is None:
+            continue
+        risk_price = abs(entry - sl)
+        if risk_price == 0:
+            continue
+        spread_cost_price = entry * (spread_pct / 100)
+        cost_r = spread_cost_price / risk_price
+        adjusted_r_seq.append(r - cost_r)
+        cost_r_seq.append(cost_r)
+
+    n = len(adjusted_r_seq)
+    if n == 0:
+        return None
+
+    wins = sum(1 for r in adjusted_r_seq if r > 0)
+    losses = n - wins
+    avg_r = sum(adjusted_r_seq) / n
+    gains = sum(r for r in adjusted_r_seq if r > 0)
+    loss_sum = abs(sum(r for r in adjusted_r_seq if r <= 0))
+    pf = gains / loss_sum if loss_sum > 0 else None
+    avg_cost_r = sum(cost_r_seq) / len(cost_r_seq)
+
+    return {
+        "n": n, "wins": wins, "losses": losses, "win_rate": wins / n,
+        "avg_r": avg_r, "profit_factor": pf, "spread_pct_used": spread_pct, "avg_cost_r": avg_cost_r,
+    }
+
+
+async def run_cost_adjusted_report(api_symbol: str, spread_pct: float | None = None):
+    """Sends a before/after comparison for each strategy type on this
+    symbol, showing whether the raw backtested edge survives a realistic
+    spread cost. This is an estimate, not a guarantee -- real costs depend
+    on your actual broker/exchange."""
+    strategy_types = ["trend", "range", "liquidity_sweep", "breakout_retest"]
+    used_pct = spread_pct if spread_pct is not None else DEFAULT_SPREAD_PCT.get(api_symbol, 0.05)
+
+    lines = [
+        f"*💸 Transaction-Cost-Adjusted Backtest: {api_symbol}*",
+        f"_Assuming {used_pct:.2f}% round-trip spread cost (estimate -- replace with your real broker's spread for a meaningful answer). "
+        f"Each trade's own actual entry/SL distance is used to convert this into an R-cost, not a flat guess._\n",
+    ]
+
+    for strategy_type in strategy_types:
+        raw = get_raw_stats_for_symbol_prefix(api_symbol, strategy_type)
+        adj = get_cost_adjusted_stats(api_symbol, strategy_type, spread_pct)
+
+        if adj is None or raw is None or raw["n"] == 0:
+            lines.append(f"*{strategy_type}*: no data")
+            continue
+
+        raw_pf = f"{raw['profit_factor']:.2f}" if raw["profit_factor"] is not None else "N/A"
+        adj_pf = f"{adj['profit_factor']:.2f}" if adj["profit_factor"] is not None else "N/A"
+        survived = adj["avg_r"] > 0
+        verdict = "✅ edge survives" if survived else "❌ edge erased by costs"
+
+        lines.append(f"*{strategy_type}* (n={raw['n']}, avg cost {adj['avg_cost_r']:.3f}R/trade):")
+        lines.append(f"  Before costs: avg R {raw['avg_r']:+.3f}, PF {raw_pf}")
+        lines.append(f"  After costs:  avg R {adj['avg_r']:+.3f}, PF {adj_pf}  -- {verdict}")
+        lines.append("")
+
+    lines.append("_This is a simplified model (flat cost subtracted from realized R, not a full slippage-adjusted re-simulation) -- treat as directional, not exact._")
+
+    await telegram_bot.send_text("\n".join(lines))
+    logger.info("Sent cost-adjusted report for %s", api_symbol)
+
+
 if __name__ == "__main__":
     asyncio.run(run_confidence_threshold_analysis())
