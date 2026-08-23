@@ -524,7 +524,6 @@ def clear_backtest_data(symbol: str) -> int:
         conn.close()
 
 
-
 def get_open_signal(symbol: str, strategy_type: str) -> dict | None:
     """Returns the most recent LONG/SHORT signal for this symbol+strategy
     combination if IT specifically hasn't been evaluated yet -- meaning, as
@@ -548,3 +547,57 @@ def get_open_signal(symbol: str, strategy_type: str) -> dict | None:
     if row is None or row[2] > 0:
         return None  # no prior signal, or the most recent one already resolved
     return {"id": row[0], "action": row[1]}
+
+
+def get_backtest_strategy_type_stats(symbol: str) -> list[dict]:
+    """Same win/loss/profit-factor/drawdown breakdown as get_backtest_summary,
+    but grouped by strategy_type (trend/range/liquidity_sweep/breakout_retest)
+    instead of lumped together -- this is what lets us actually compare
+    which detection engine produces the best expectancy, rather than
+    guessing."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT e.strategy_type, o.outcome, o.r_multiple
+               FROM backtest_outcomes o
+               JOIN all_evaluations e ON e.id = o.evaluation_id
+               WHERE e.source='backtest' AND e.symbol=?""",
+            (symbol,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_strategy: dict[str, dict] = {}
+    for strategy_type, outcome, r in rows:
+        b = by_strategy.setdefault(strategy_type, {"wins": 0, "losses": 0, "expired": 0, "r_sum": 0.0, "resolved": 0, "r_sequence": []})
+        if outcome == "WIN":
+            b["wins"] += 1
+            b["r_sum"] += r
+            b["resolved"] += 1
+            b["r_sequence"].append(r)
+        elif outcome == "LOSS":
+            b["losses"] += 1
+            b["r_sum"] += r
+            b["resolved"] += 1
+            b["r_sequence"].append(r)
+        else:
+            b["expired"] += 1
+
+    result = []
+    for strategy_type, b in by_strategy.items():
+        win_rate = b["wins"] / b["resolved"] if b["resolved"] else None
+        avg_r = b["r_sum"] / b["resolved"] if b["resolved"] else None
+        gains = sum(r for r in b["r_sequence"] if r > 0)
+        loss_sum = abs(sum(r for r in b["r_sequence"] if r < 0))
+        profit_factor = gains / loss_sum if loss_sum > 0 else None
+        cum, peak, max_dd = 0.0, 0.0, 0.0
+        for r in b["r_sequence"]:
+            cum += r
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
+        result.append({
+            "strategy_type": strategy_type, "trades": b["resolved"], "wins": b["wins"], "losses": b["losses"],
+            "expired": b["expired"], "win_rate": win_rate, "avg_r": avg_r,
+            "profit_factor": profit_factor, "max_drawdown_r": max_dd,
+        })
+    return sorted(result, key=lambda x: -x["trades"])
