@@ -1,0 +1,66 @@
+name: Target Calculator
+
+# Manual-only. Uses trend's REAL measured cost-adjusted edge and trade
+# frequency from already-collected backtest data to compute what risk per
+# trade (and account size) would be needed to reach your target daily
+# profit -- using measured numbers, not a guess. Run a Historical Backtest
+# for this symbol first (ideally with atr_timeframe=1h or 4h).
+on:
+  workflow_dispatch:
+    inputs:
+      api_symbol:
+        description: "Symbol to analyze (e.g. BTC/USD, XAU/USD)"
+        required: false
+        default: "BTC/USD"
+      target_daily_profit:
+        description: "Target net daily profit (in your account currency)"
+        required: false
+        default: "30"
+      spread_pct:
+        description: "Round-trip spread cost as % of price (leave blank for a rough default)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  target-calculator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run target calculator
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.analytics import run_target_calculator
+          spread = '${{ github.event.inputs.spread_pct }}'.strip().replace(',', '.')
+          asyncio.run(run_target_calculator(
+              api_symbol='${{ github.event.inputs.api_symbol }}',
+              target_daily_profit=float('${{ github.event.inputs.target_daily_profit }}'.replace(',', '.')),
+              spread_pct=float(spread) if spread else None,
+          ))
+          "
