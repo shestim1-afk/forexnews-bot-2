@@ -128,12 +128,17 @@ async def handle_command(chat_id: str, command: str) -> None:
     await reply_to(chat_id, f"Running fresh analysis for {symbol_cfg['display']}, one moment...")
 
     block, actionable_signals, _ = scalp_analysis.analyze_symbol(symbol_cfg)
+    evidence_lines = []
     for sig in actionable_signals:
         db.save_scalp_signal(
             symbol=sig["symbol"], action=sig["action"], entry=sig["entry"], sl=sig["sl"],
             tp1=sig["tp1"], tp2=sig["tp2"], confidence=sig["confidence"],
             details=sig["details"] + " (on-demand)", strategy_type=sig["strategy_type"],
         )
+        evidence = db.get_strategy_evidence_label(api_symbol, sig["strategy_type"])
+        evidence_lines.append(f"{sig['strategy_type']}: {evidence}")
+    if evidence_lines:
+        block = block + "\n\n_Backtested track record:_\n" + "\n".join(evidence_lines)
     await reply_to(chat_id, block)
 
 
