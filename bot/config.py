@@ -34,7 +34,7 @@ CLASSIFY_DELAY_SECONDS = float(os.getenv("CLASSIFY_DELAY_SECONDS", "4.5"))
 # --- Position sizing (used by the scalp bot's risk engine) ---
 # These are placeholders -- personalize to your actual account before
 # trusting the position sizes shown in any signal.
-ACCOUNT_SIZE_USD = float(os.getenv("ACCOUNT_SIZE_USD", "1000"))
+ACCOUNT_SIZE_USD = _safe_float_env("ACCOUNT_SIZE_USD", "1000")
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.0"))
 
 # --- Daily risk controller (paper-trading simulation) ---
@@ -56,7 +56,7 @@ MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
 # risk setting, separate from RISK_PCT_PER_TRADE above -- starting
 # cautiously at 0.25%, not the general default, per the forward-test plan:
 # confirm live behavior matches the backtest before scaling risk up.
-XAU_SWING_RISK_PCT = float(os.getenv("XAU_SWING_RISK_PCT", "0.25"))
+XAU_SWING_RISK_PCT = _safe_float_env("XAU_SWING_RISK_PCT", "0.25")
 XAU_SWING_ATR_TIMEFRAME = "4h"
 XAU_SWING_LOOKAHEAD_HOURS = 168  # 7 days -- matches the validated backtest configuration
 
