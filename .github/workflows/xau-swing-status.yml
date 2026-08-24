@@ -1,0 +1,48 @@
+name: XAU 4H-Swing Forward Test - Status
+
+# Manual-only. Sends the current cumulative P&L, trade count, and max
+# drawdown for the isolated 4H-swing forward test, anytime you want to
+# check on it.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  xau-swing-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Send forward test status
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ACCOUNT_SIZE_USD: ${{ secrets.ACCOUNT_SIZE_USD }}
+          XAU_SWING_RISK_PCT: ${{ secrets.XAU_SWING_RISK_PCT }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.xau_swing import send_forward_test_status
+          asyncio.run(send_forward_test_status())
+          "
