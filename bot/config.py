@@ -3,6 +3,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _safe_float_env(key: str, default: str) -> float:
+    """Like float(os.getenv(key, default)), but also falls back to the
+    default when the env var is SET but empty -- GitHub Actions sets a
+    referenced secret to an empty string (not "unset") if that secret
+    doesn't exist in the repo yet, which would otherwise crash here."""
+    val = os.getenv(key, "").strip()
+    return float(val) if val else float(default)
+
 # --- Secrets / required ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
