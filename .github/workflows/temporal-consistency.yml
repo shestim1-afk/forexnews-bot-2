@@ -1,0 +1,60 @@
+name: Temporal Consistency Check
+
+# Manual-only. Splits already-collected backtest data by calendar month to
+# check whether an edge held up consistently over time, or was
+# concentrated in one lucky stretch. Uses data already in the database --
+# no new API calls needed. Not a substitute for true out-of-sample
+# validation, but a real, free robustness check.
+on:
+  workflow_dispatch:
+    inputs:
+      api_symbol:
+        description: "Symbol/tag to check, e.g. 'XAU/USD [4h-ATR]' (must match a symbol tag already in the database)"
+        required: false
+        default: "XAU/USD [4h-ATR]"
+      strategy_type:
+        description: "trend / range / liquidity_sweep / breakout_retest"
+        required: false
+        default: "trend"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  temporal-consistency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run temporal consistency check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.analytics import run_temporal_consistency_report
+          asyncio.run(run_temporal_consistency_report(
+              api_symbol='${{ github.event.inputs.api_symbol }}',
+              strategy_type='${{ github.event.inputs.strategy_type }}',
+          ))
+          "
