@@ -1,0 +1,95 @@
+name: Grid Strategy Stress Test
+
+# Manual-only. Tests a grid/martingale-style "basket" strategy (like the
+# Agent Smith / Matrix Escape product) against REAL historical gold data,
+# with hard safety caps active (max layers, max basket loss %) that many
+# commercial vendors of this style don't disclose or bound at all.
+#
+# Fetches FRESH price data (this does NOT reuse prior backtest results --
+# only derived stats were saved before, not raw candles), so this uses
+# real API credits, same as other Historical Backtest runs.
+#
+# To specifically stress-test the high-volatility period gold entered in
+# late 2025, set deep_start_date=2025-09-01 and deep_end_date=2025-12-31.
+on:
+  workflow_dispatch:
+    inputs:
+      api_symbol:
+        description: "Symbol (e.g. XAU/USD)"
+        required: false
+        default: "XAU/USD"
+      deep_start_date:
+        description: "Start date YYYY-MM-DD (leave blank for the fast ~17-day default)"
+        required: false
+        default: ""
+      deep_end_date:
+        description: "End date YYYY-MM-DD (leave blank for the fast ~17-day default)"
+        required: false
+        default: ""
+      max_layers:
+        description: "Hard cap: max number of averaging layers per basket"
+        required: false
+        default: "5"
+      max_basket_loss_pct:
+        description: "Hard cap: max loss per basket, as % of account (force-closes regardless of averaging plan)"
+        required: false
+        default: "10"
+      layer_risk_pct:
+        description: "% of account committed per layer"
+        required: false
+        default: "0.5"
+      account_size:
+        description: "Simulated account size"
+        required: false
+        default: "2000"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  grid-stress-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run grid strategy stress test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.grid_backtest import run
+          deep_start = '${{ github.event.inputs.deep_start_date }}' or None
+          deep_end = '${{ github.event.inputs.deep_end_date }}' or None
+          asyncio.run(run(
+              api_symbol='${{ github.event.inputs.api_symbol }}',
+              display_symbol='${{ github.event.inputs.api_symbol }}',
+              deep_start_date=deep_start,
+              deep_end_date=deep_end,
+              max_layers=int('${{ github.event.inputs.max_layers }}'),
+              max_basket_loss_pct=float('${{ github.event.inputs.max_basket_loss_pct }}'.replace(',', '.')),
+              layer_risk_pct=float('${{ github.event.inputs.layer_risk_pct }}'.replace(',', '.')),
+              account_size=float('${{ github.event.inputs.account_size }}'.replace(',', '.')),
+          ))
+          "
