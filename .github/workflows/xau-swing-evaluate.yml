@@ -1,0 +1,52 @@
+name: XAU 4H-Swing Forward Test - Evaluate Outcomes
+
+# Runs a few times a day, checking any unresolved swing signals against
+# real subsequent price using the SAME logic the backtest was validated
+# with. Trades here can take days to resolve, so this doesn't need to run
+# as often as the signal check.
+on:
+  schedule:
+    - cron: "20 2,14 * * *"  # twice a day, UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  xau-swing-evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Evaluate any unresolved swing signals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          ACCOUNT_SIZE_USD: ${{ secrets.ACCOUNT_SIZE_USD }}
+          XAU_SWING_RISK_PCT: ${{ secrets.XAU_SWING_RISK_PCT }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.xau_swing import evaluate_outcomes
+          asyncio.run(evaluate_outcomes())
+          "
