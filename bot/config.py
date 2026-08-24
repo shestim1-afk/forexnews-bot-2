@@ -41,6 +41,17 @@ MAX_DAILY_RISK_PCT = float(os.getenv("MAX_DAILY_RISK_PCT", str(RISK_PCT_PER_TRAD
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
 
+# --- XAU/USD 4H-ATR swing forward test ---
+# This is the ONE configuration in this project with a real, validated,
+# cost-adjusted positive edge (gold trend-following, sized with 4H ATR
+# instead of the tight 5m default). Deliberately isolated with its OWN
+# risk setting, separate from RISK_PCT_PER_TRADE above -- starting
+# cautiously at 0.25%, not the general default, per the forward-test plan:
+# confirm live behavior matches the backtest before scaling risk up.
+XAU_SWING_RISK_PCT = float(os.getenv("XAU_SWING_RISK_PCT", "0.25"))
+XAU_SWING_ATR_TIMEFRAME = "4h"
+XAU_SWING_LOOKAHEAD_HOURS = 168  # 7 days -- matches the validated backtest configuration
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "seen.sqlite3")
 
 # --- RSS feeds, grouped by category. Add/remove freely. ---
