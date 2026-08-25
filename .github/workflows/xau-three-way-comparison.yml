@@ -1,0 +1,54 @@
+name: XAU Three-Way Comparison
+
+# Manual-only. Compares XAU 4H baseline, XAU 4H 1.0R candidate, and XAU
+# 1H-ATR side by side, using already-collected backtest data (no new API
+# calls). Run the 1H-ATR Historical Backtest first if you haven't yet.
+on:
+  workflow_dispatch:
+    inputs:
+      spread_pct:
+        description: "Round-trip spread cost as % of price for XAU (leave blank for the 0.03% default)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  xau-three-way-comparison:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run three-way comparison report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.analytics import run_three_way_comparison_report
+          spread = '${{ github.event.inputs.spread_pct }}'.strip().replace(',', '.')
+          asyncio.run(run_three_way_comparison_report(
+              spread_pct_xau=float(spread) if spread else None,
+          ))
+          "
