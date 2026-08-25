@@ -1,0 +1,77 @@
+name: Volatility Compression Backtest
+
+# Manual-only. Tests the frozen "compression -> expansion" hypothesis:
+# does an objectively-defined period of unusually low volatility predict
+# a subsequent tradeable expansion move. All parameters are frozen per
+# the pre-declared protocol -- see bot/vol_compression.py's module
+# docstring for the exact definitions. Results are tagged distinctly
+# (strategy_type='vol_compression') so the existing Cost-Adjusted
+# Analysis, Temporal Consistency, and MAE/MFE Diagnostic workflows all
+# work on this automatically -- run those next using the symbol tag this
+# workflow reports back.
+on:
+  workflow_dispatch:
+    inputs:
+      api_symbol:
+        description: "Symbol (start with XAU/USD; only test BTC/USD afterward if XAU is genuinely promising)"
+        required: false
+        default: "XAU/USD"
+      display_symbol:
+        description: "How it should appear in the Telegram message"
+        required: false
+        default: "XAU/USD"
+      deep_start_date:
+        description: "Start date YYYY-MM-DD (leave blank for the fast ~17-day default)"
+        required: false
+        default: "2025-01-01"
+      deep_end_date:
+        description: "End date YYYY-MM-DD (leave blank for the fast ~17-day default)"
+        required: false
+        default: "2025-12-31"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  vol-compression-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run volatility compression backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.vol_compression import run
+          deep_start = '${{ github.event.inputs.deep_start_date }}' or None
+          deep_end = '${{ github.event.inputs.deep_end_date }}' or None
+          asyncio.run(run(
+              api_symbol='${{ github.event.inputs.api_symbol }}',
+              display_symbol='${{ github.event.inputs.display_symbol }}',
+              deep_start_date=deep_start,
+              deep_end_date=deep_end,
+          ))
+          "
