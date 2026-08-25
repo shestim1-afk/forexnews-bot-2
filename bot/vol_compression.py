@@ -253,9 +253,11 @@ async def run(api_symbol: str = "XAU/USD", display_symbol: str = "XAU/USD",
         "_Frozen parameters: 15th percentile ATR compression, 6-candle minimum duration, "
         f"{EXPANSION_TRUE_RANGE_MULT}x TR expansion trigger within {EXPANSION_WATCH_WINDOW} candles, "
         f"{TP_R_MULT}R fixed exit (temporary research control). Run the standard Cost-Adjusted Analysis, "
-        f"Temporal Consistency, and MAE/MFE Diagnostic reports against '{result_symbol}' / '{STRATEGY_TYPE}' "
+        "Temporal Consistency, and MAE/MFE Diagnostic reports against the symbol/strategy tags below "
         "for full expectancy analysis using existing tooling._"
     )
+    lines.append(f"Symbol tag: `{result_symbol}`")
+    lines.append(f"Strategy type: `{STRATEGY_TYPE}`")
 
     await telegram_bot.send_text("\n".join(lines))
     logger.info("Sent volatility compression report")
