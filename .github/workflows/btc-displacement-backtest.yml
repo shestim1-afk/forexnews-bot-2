@@ -1,0 +1,57 @@
+name: BTC Displacement Backtest
+
+# Manual-only. Tests the frozen "large displacement -> momentum
+# continuation" hypothesis on BTC. All parameters are frozen per the
+# approved specification -- see bot/btc_displacement.py's module
+# docstring. Run with period=dev FIRST; only run period=oos after
+# explicitly reviewing and approving the dev result. Results are tagged
+# distinctly (strategy_type='btc_displacement') so existing Cost-Adjusted
+# Analysis / Temporal Consistency / MAE-MFE Diagnostic tools work on this
+# automatically using the symbol tag this workflow reports back.
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "dev (2025-01-01 to 2025-08-31) or oos (2025-09-01 to 2025-12-31) -- only run oos after reviewing dev"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  btc-displacement-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run BTC displacement backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.btc_displacement import run
+          asyncio.run(run(period='${{ github.event.inputs.period }}'))
+          "
