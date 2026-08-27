@@ -1,0 +1,36 @@
+name: XAU Level Rejection - Phase 1 Data Audit
+
+# Manual-only. Phase 1 of the Higher-Timeframe Structural Level Rejection
+# study: checks whether daily/weekly XAU/USD data is available with
+# sufficient depth via our existing feed. Per protocol, if this fails,
+# the hypothesis stops here -- no strategy or backtest follows. No
+# strategy is built and the production bot is untouched regardless.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  level-rejection-data-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Phase 1 data audit
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python -m bot.xau_level_rejection
