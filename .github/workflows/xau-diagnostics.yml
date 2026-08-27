@@ -1,0 +1,71 @@
+name: XAU Diagnostic Studies
+
+# Manual-only. Diagnostic studies on the validated XAU/USD 4H-ATR trend
+# strategy: does session timing or confidence score already contain
+# predictive information? Uses already-collected backtest data (no new
+# API calls). Does NOT touch the live bot or the forward tests.
+on:
+  workflow_dispatch:
+    inputs:
+      study:
+        description: "session / confidence / portfolio"
+        required: false
+        default: "session"
+      period:
+        description: "dev (2025-01-01 to 2025-08-31) or oos (2025-09-01 to 2025-12-31) -- only run oos after a dev finding is DEVELOPMENT PROMISING"
+        required: false
+        default: "dev"
+      spread_pct:
+        description: "Round-trip spread cost as % of price (leave blank for the XAU default)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  xau-diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run diagnostic study
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.xau_diagnostics import run_session_study, run_confidence_study, run_portfolio_projection
+          spread = '${{ github.event.inputs.spread_pct }}'.strip().replace(',', '.')
+          spread_pct = float(spread) if spread else None
+          study = '${{ github.event.inputs.study }}'
+          period = '${{ github.event.inputs.period }}'
+          if study == 'session':
+              asyncio.run(run_session_study(period=period, spread_pct=spread_pct))
+          elif study == 'confidence':
+              asyncio.run(run_confidence_study(period=period, spread_pct=spread_pct))
+          elif study == 'portfolio':
+              asyncio.run(run_portfolio_projection())
+          else:
+              raise ValueError(f'Unknown study: {study}')
+          "
