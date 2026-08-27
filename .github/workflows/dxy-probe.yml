@@ -1,0 +1,37 @@
+name: DXY Feasibility Probe
+
+# Manual-only. Checks whether DXY (or a working symbol convention for it)
+# is available on our existing Twelve Data free-tier plan, with
+# sufficient historical depth and granularity to research whether it adds
+# predictive value to the XAU/USD 4H trend signal. This is a DATA
+# AVAILABILITY CHECK ONLY -- no strategy is built, no backtest is run,
+# and the production bot is not touched.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dxy-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run DXY feasibility probe
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python -m bot.dxy_probe
