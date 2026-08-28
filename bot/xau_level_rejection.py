@@ -188,5 +188,220 @@ def is_level_expired(level: dict, current_price: float, daily_atr_at_touch: floa
     return abs(current_price - level["price"]) > EXPIRATION_ATR_MULT * daily_atr_at_touch
 
 
+def find_approach_events(df_4h: pd.DataFrame, df_daily: pd.DataFrame, df_weekly: pd.DataFrame,
+                          daily_swings: list[dict], weekly_swings: list[dict],
+                          start_date, end_date, cooldown_candles: int = 4) -> list[dict]:
+    """Scans every 4H candle in [start_date, end_date) for an approach to
+    an ACTIVE level (no lookahead -- levels as of each candle's own
+    timestamp). A simple, frozen cooldown avoids trivially over-counting
+    many consecutive candles hovering near the same level as independent
+    events."""
+    atr_4h = ta.volatility.AverageTrueRange(df_4h["high"], df_4h["low"], df_4h["close"], window=14).average_true_range()
+    events = []
+    last_event_idx_for_level: dict[float, int] = {}
+
+    mask = (df_4h["datetime"] >= start_date) & (df_4h["datetime"] < end_date)
+    for i in df_4h[mask].index:
+        atr_val = atr_4h.iloc[i]
+        if pd.isna(atr_val) or atr_val == 0:
+            continue
+        candle_time = df_4h["datetime"].iloc[i]
+        candle_high, candle_low, candle_close = df_4h["high"].iloc[i], df_4h["low"].iloc[i], df_4h["close"].iloc[i]
+        threshold = APPROACH_ATR_MULT_4H * atr_val
+
+        daily_levels = get_active_levels_as_of(daily_swings, candle_time, DAILY_LOOKBACK_CANDLES, df_daily)
+        weekly_levels = get_active_levels_as_of(weekly_swings, candle_time, WEEKLY_LOOKBACK_CANDLES, df_weekly)
+
+        for level, level_type in [(l, "daily") for l in daily_levels] + [(l, "weekly") for l in weekly_levels]:
+            key = round(level["price"], 2)
+            if key in last_event_idx_for_level and i - last_event_idx_for_level[key] < cooldown_candles:
+                continue
+            if level["price"] - threshold <= candle_high <= level["price"] and candle_close < level["price"]:
+                events.append({
+                    "index": i, "time": candle_time, "level_price": level["price"], "level_type": level_type,
+                    "approach_direction": "from_below", "level_strength": level["strength"], "atr_at_event": atr_val,
+                })
+                last_event_idx_for_level[key] = i
+            elif level["price"] <= candle_low <= level["price"] + threshold and candle_close > level["price"]:
+                events.append({
+                    "index": i, "time": candle_time, "level_price": level["price"], "level_type": level_type,
+                    "approach_direction": "from_above", "level_strength": level["strength"], "atr_at_event": atr_val,
+                })
+                last_event_idx_for_level[key] = i
+    return events
+
+
+def measure_reaction(df_4h: pd.DataFrame, event_index: int, direction: str, atr_at_event: float,
+                      horizon: int = 20) -> dict | None:
+    """Measures, over the next `horizon` 4H candles, how far price moved
+    in the REACTION direction (away from the level -- the hypothesized
+    rejection) versus the CONTINUATION direction (through the level),
+    both in ATR units at the time of the event. Also flags whether price
+    actually closed beyond the level within the window."""
+    n = len(df_4h)
+    if event_index + horizon >= n:
+        return None
+    entry_price = df_4h["close"].iloc[event_index]
+    forward = df_4h.iloc[event_index + 1: event_index + 1 + horizon]
+
+    if direction == "from_below":  # level = resistance; reaction = DOWN, continuation = UP (through it)
+        reaction_r = (entry_price - forward["low"].min()) / atr_at_event
+        continuation_r = (forward["high"].max() - entry_price) / atr_at_event
+    else:  # from_above; level = support; reaction = UP, continuation = DOWN (through it)
+        reaction_r = (forward["high"].max() - entry_price) / atr_at_event
+        continuation_r = (entry_price - forward["low"].min()) / atr_at_event
+
+    return {"reaction_r": reaction_r, "continuation_r": continuation_r, "rejected": reaction_r > continuation_r}
+
+
+def sample_baseline_events(df_4h: pd.DataFrame, approach_indices: set[int], start_date, end_date,
+                            sample_size: int = 300, seed: int = 11) -> list[dict]:
+    """Random 4H candles in the SAME window that are NOT flagged as near
+    any active level, each assigned a RANDOM 50/50 direction -- the fair
+    baseline for 'if you had no level information and just guessed'."""
+    import random
+    random.seed(seed)
+    atr_4h = ta.volatility.AverageTrueRange(df_4h["high"], df_4h["low"], df_4h["close"], window=14).average_true_range()
+    mask = (df_4h["datetime"] >= start_date) & (df_4h["datetime"] < end_date)
+    candidate_indices = [i for i in df_4h[mask].index if i not in approach_indices and pd.notna(atr_4h.iloc[i]) and atr_4h.iloc[i] > 0]
+    sampled = random.sample(candidate_indices, min(sample_size, len(candidate_indices)))
+
+    results = []
+    for i in sampled:
+        direction = random.choice(["from_below", "from_above"])
+        results.append({"index": i, "direction": direction, "atr_at_event": atr_4h.iloc[i]})
+    return results
+
+
+def two_proportion_z_test(x1: int, n1: int, x2: int, n2: int) -> float | None:
+    """Standard two-proportion z-test -- correctly accounts for sample
+    size, unlike a flat percentage-point threshold (an earlier version of
+    this module used exactly that, and rigorous testing caught it
+    producing a false-positive PROMISING verdict on pure random synthetic
+    data with no genuine level effect at all)."""
+    import math
+    if n1 == 0 or n2 == 0:
+        return None
+    p1, p2 = x1 / n1, x2 / n2
+    p_pool = (x1 + x2) / (n1 + n2)
+    if p_pool == 0 or p_pool == 1:
+        return None
+    se = math.sqrt(p_pool * (1 - p_pool) * (1 / n1 + 1 / n2))
+    if se == 0:
+        return None
+    return (p1 - p2) / se
+
+
+async def run_information_content_test(period: str = "dev"):
+    """Phase 3 -- the critical, result-independent gate. Does NOT build
+    or test a trading rule; only measures whether price behaves
+    differently near a structural level than at a random comparable
+    baseline. Nothing here is optimized; the level definition and horizon
+    are frozen per the Phase 2 specification."""
+    start_date, end_date = (DEV_START, DEV_END) if period == "dev" else (OOS_START, OOS_END)
+    start_dt, end_dt = datetime.strptime(start_date, "%Y-%m-%d"), datetime.strptime(end_date, "%Y-%m-%d")
+
+    logger.info("Fetching daily, weekly, and 4H XAU/USD data...")
+    target_start = datetime.strptime(LEVEL_HISTORY_START, "%Y-%m-%d")
+    target_end = end_dt + timedelta(days=1)
+    df_daily = fetch_paginated_history(API_SYMBOL, "1day", target_start, target_end)
+    df_weekly = fetch_paginated_history(API_SYMBOL, "1week", target_start, target_end)
+    df_4h = fetch_paginated_history(API_SYMBOL, "4h", target_start, target_end)
+
+    if df_daily is None or df_weekly is None or df_4h is None:
+        await telegram_bot.send_text("*📐 Structural Level Rejection -- Phase 3*\n\nData fetch failed -- aborting.")
+        return
+
+    logger.info("Detecting swing points...")
+    daily_swings = detect_swing_points(df_daily)
+    weekly_swings = detect_swing_points(df_weekly)
+    logger.info("%d daily swings, %d weekly swings detected", len(daily_swings), len(weekly_swings))
+
+    events = find_approach_events(df_4h, df_daily, df_weekly, daily_swings, weekly_swings, start_dt, end_dt)
+    logger.info("%d approach events detected", len(events))
+
+    HORIZON = 20
+    event_reactions = []
+    for e in events:
+        r = measure_reaction(df_4h, e["index"], e["approach_direction"], e["atr_at_event"], horizon=HORIZON)
+        if r is not None:
+            r.update(e)
+            event_reactions.append(r)
+
+    approach_indices = {e["index"] for e in events}
+    baseline_events = sample_baseline_events(df_4h, approach_indices, start_dt, end_dt)
+    baseline_reactions = []
+    for b in baseline_events:
+        r = measure_reaction(df_4h, b["index"], b["direction"], b["atr_at_event"], horizon=HORIZON)
+        if r is not None:
+            baseline_reactions.append(r)
+
+    n_events = len(event_reactions)
+    n_baseline = len(baseline_reactions)
+
+    lines = [
+        f"*📐 Structural Level Rejection -- Phase 3: Information Content ({period.upper()})*",
+        "_Testing ONLY whether price behaves differently near a level vs a random baseline. No trading rule yet._\n",
+    ]
+
+    if n_events == 0:
+        lines.append("No qualifying approach events detected in this period.")
+        lines.append("\n*RESULT: FAILED -- no events to analyze.*")
+        await telegram_bot.send_text("\n".join(lines))
+        return
+
+    avg_reaction_event = sum(e["reaction_r"] for e in event_reactions) / n_events
+    avg_continuation_event = sum(e["continuation_r"] for e in event_reactions) / n_events
+    reject_rate_event = sum(1 for e in event_reactions if e["rejected"]) / n_events
+
+    avg_reaction_baseline = sum(b["reaction_r"] for b in baseline_reactions) / n_baseline if n_baseline else None
+    avg_continuation_baseline = sum(b["continuation_r"] for b in baseline_reactions) / n_baseline if n_baseline else None
+    reject_rate_baseline = sum(1 for b in baseline_reactions if b["rejected"]) / n_baseline if n_baseline else None
+
+    lines.append(f"Approach events: {n_events} (n from_below={sum(1 for e in event_reactions if e['approach_direction']=='from_below')}, "
+                 f"from_above={sum(1 for e in event_reactions if e['approach_direction']=='from_above')})")
+    lines.append(f"  daily levels: {sum(1 for e in event_reactions if e['level_type']=='daily')}, weekly levels: {sum(1 for e in event_reactions if e['level_type']=='weekly')}")
+    lines.append("")
+    lines.append("*Near-level events*")
+    lines.append(f"  Avg reaction (away from level): {avg_reaction_event:+.3f} ATR")
+    lines.append(f"  Avg continuation (through level): {avg_continuation_event:+.3f} ATR")
+    lines.append(f"  Rejection rate (reaction > continuation): {reject_rate_event*100:.1f}%")
+    lines.append("")
+    lines.append(f"*Random-direction baseline (n={n_baseline})*")
+    if avg_reaction_baseline is not None:
+        lines.append(f"  Avg reaction: {avg_reaction_baseline:+.3f} ATR")
+        lines.append(f"  Avg continuation: {avg_continuation_baseline:+.3f} ATR")
+        lines.append(f"  Rejection rate: {reject_rate_baseline*100:.1f}%")
+
+    info_edge = reject_rate_event - reject_rate_baseline if reject_rate_baseline is not None else None
+    z_score = None
+    if reject_rate_baseline is not None and n_baseline:
+        x_event = sum(1 for e in event_reactions if e["rejected"])
+        x_baseline = sum(1 for b in baseline_reactions if b["rejected"])
+        z_score = two_proportion_z_test(x_event, n_events, x_baseline, n_baseline)
+
+    lines.append("")
+    if info_edge is not None:
+        lines.append(f"*Information edge: {info_edge*100:+.1f} percentage points rejection rate vs random baseline*")
+        z_str = f"{z_score:.2f}" if z_score is not None else "N/A"
+        lines.append(f"*Two-proportion z-score: {z_str}* (needs |z|>1.96 for 95% significance -- not just a raw percentage-point gap, which was tested and found to false-positive on pure random data)")
+        if n_events < 30:
+            verdict = "INCONCLUSIVE -- sample too small to draw a confident conclusion, regardless of the apparent edge."
+        elif z_score is not None and abs(z_score) > 1.96 and info_edge > 0:
+            verdict = "PROMISING -- statistically significant edge over baseline, adequate sample. Phase 4 (trading rule) is justified."
+        else:
+            verdict = "FAILED -- no statistically significant information advantage over a random-direction baseline."
+        lines.append(f"*RESULT: {verdict}*")
+
+    lines.append(
+        "\n_This measures REACTION vs a fair baseline only -- it is not a trading strategy and includes no "
+        "transaction costs, entry confirmation, or stop/exit logic. A positive result here justifies designing "
+        "a trading rule (Phase 4); it is not evidence that rule will be profitable._"
+    )
+
+    await telegram_bot.send_text("\n".join(lines))
+    logger.info("Sent Phase 3 information content report (%s)", period)
+
+
 if __name__ == "__main__":
     asyncio.run(run_data_audit())
