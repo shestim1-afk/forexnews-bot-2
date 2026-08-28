@@ -6,7 +6,16 @@ name: XAU Level Rejection - Phase 1 Data Audit
 # the hypothesis stops here -- no strategy or backtest follows. No
 # strategy is built and the production bot is untouched regardless.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "1 (data audit) or 3 (information content test) -- only run 3 after Phase 1 passes"
+        required: false
+        default: "1"
+      period:
+        description: "dev (2025-01-01 to 2025-08-31) or oos -- only run oos if Phase 3 dev result is PROMISING"
+        required: false
+        default: "dev"
 
 permissions:
   contents: read
@@ -28,9 +37,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Phase 1 data audit
+      - name: Run study phase
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-        run: python -m bot.xau_level_rejection
+        run: |
+          python -c "
+          import asyncio
+          from bot.xau_level_rejection import run_data_audit, run_information_content_test
+          phase = '${{ github.event.inputs.phase }}'
+          period = '${{ github.event.inputs.period }}'
+          if phase == '1':
+              asyncio.run(run_data_audit())
+          elif phase == '3':
+              asyncio.run(run_information_content_test(period=period))
+          else:
+              raise ValueError(f'Unknown phase: {phase}')
+          "
