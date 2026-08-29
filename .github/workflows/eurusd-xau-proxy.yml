@@ -1,0 +1,64 @@
+name: EURUSD USD-Proxy Refinement Test
+
+# Manual-only. Tests whether EUR/USD's prior-candle state adds
+# incremental predictive information to the ALREADY-VALIDATED XAU 4H
+# trend signal. This is a refinement test, not a new strategy -- XAU
+# entry/exit/sizing are completely unchanged. Per protocol, a positive
+# result modifies the existing 0.403 R/day figure; it is never additive
+# to the portfolio. Run period=dev first; only run period=oos if the dev
+# result is DEVELOPMENT PROMISING.
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "dev (2025-01-01 to 2025-08-31) or oos (2025-09-01 to 2025-12-31) -- only run oos if dev is DEVELOPMENT PROMISING"
+        required: false
+        default: "dev"
+      spread_pct:
+        description: "Round-trip spread cost as % of price (leave blank for the XAU default -- this is the ONLY cost applied, EUR/USD is an input, not a second leg)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  eurusd-xau-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run EUR/USD proxy test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.eurusd_xau_proxy import run_test
+          spread = '${{ github.event.inputs.spread_pct }}'.strip().replace(',', '.')
+          asyncio.run(run_test(
+              period='${{ github.event.inputs.period }}',
+              spread_pct=float(spread) if spread else None,
+          ))
+          "
