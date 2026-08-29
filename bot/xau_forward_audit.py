@@ -24,10 +24,17 @@ from datetime import datetime
 from . import db
 from . import telegram_bot
 from .analytics import get_default_spread_pct
-from .xau_swing import (
-    SYMBOL_TAG, STRATEGY_TYPE, CANDIDATE_SYMBOL_TAG, CANDIDATE_STRATEGY_TYPE,
-    MIN_TRADES_FOR_COMPARISON,
-)
+from .xau_swing import SYMBOL_TAG, STRATEGY_TYPE
+
+# Candidate constants defined LOCALLY, not imported from xau_swing.py --
+# this avoids fragile cross-file coupling (an import error here revealed
+# that the deployed xau_swing.py may not have these names at all, worth
+# separately verifying whether the candidate forward test is actually
+# running). These values match what was specified when the A/B candidate
+# system was built earlier in this project.
+CANDIDATE_SYMBOL_TAG = "Gold (XAU/USD) [4h-swing-candidate-1.0R]"
+CANDIDATE_STRATEGY_TYPE = "trend_4h_swing_candidate_1_0r"
+MIN_TRADES_FOR_COMPARISON = 20
 
 logging.basicConfig(
     level=logging.INFO,
