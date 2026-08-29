@@ -1,0 +1,53 @@
+name: XAU Forward-Test Audit
+
+# Manual-only. Rigorous, read-only audit of the two LIVE forward-test
+# configurations (baseline TP1=0.667R, candidate TP1=1.0R). Does NOT
+# modify bot/xau_swing.py or either strategy -- only reads
+# already-collected signal_outcomes/scalp_signals data and reports on it.
+on:
+  workflow_dispatch:
+    inputs:
+      spread_pct:
+        description: "Round-trip spread cost as % of price for the net-R calculation (leave blank for the XAU default)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  xau-forward-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run forward-test audit
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.xau_forward_audit import run_audit
+          spread = '${{ github.event.inputs.spread_pct }}'.strip().replace(',', '.')
+          asyncio.run(run_audit(spread_pct=float(spread) if spread else None))
+          "
