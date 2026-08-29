@@ -1,0 +1,36 @@
+name: EURUSD-GBPUSD Cointegration Test
+
+# Manual-only. Phase 1 ONLY of the statistical arbitrage hypothesis: a
+# real Engle-Granger cointegration test (OLS + Augmented Dickey-Fuller on
+# residuals) between EUR/USD and GBP/USD. No trading rule is built, no
+# backtest runs, and the production bot is untouched. Per protocol, if
+# this fails (not cointegrated), the hypothesis stops here.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  eurusd-gbpusd-cointegration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run cointegration test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python -m bot.eurusd_gbpusd_coint
