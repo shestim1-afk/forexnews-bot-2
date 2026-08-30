@@ -1,0 +1,46 @@
+name: XAU Checkpoint Readiness Monitor
+
+# Runs on the same schedule as evaluation, checking whether both the
+# baseline and 1.0R candidate have crossed the 30-resolved-trade
+# threshold. Sends exactly ONE Telegram notification on the NOT READY ->
+# READY transition -- never repeats it, never runs the checkpoint
+# analysis itself, never touches bot/xau_swing.py or either live
+# configuration. Notification/monitoring only.
+on:
+  schedule:
+    - cron: "30 2,14 * * *"  # twice daily, offset from the evaluation workflow
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  xau-checkpoint-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Check checkpoint readiness
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m bot.xau_checkpoint_monitor
