@@ -150,13 +150,17 @@ async def run():
     lines.append("")
     if covers_dev and covers_oos:
         lines.append("*CLASSIFICATION: READY FOR RESEARCH*")
+        # NOT wrapped in italics -- a backtick code-span nested inside an
+        # italic span is unreliable in Telegram's legacy Markdown parser
+        # even when characters technically pair up (confirmed failing
+        # elsewhere in this project with "can't find end of the entity").
         lines.append(
-            f"_`{test_symbol}` is empirically confirmed to exist, fetch reliably, and cover the full required "
+            f"`{test_symbol}` is empirically confirmed to exist, fetch reliably, and cover the full required "
             f"dev+OOS window at 4H granularity via our existing free-tier infrastructure, with no new cost. "
             f"This clears the data-foundation bar -- it does NOT mean DXY will improve XAU trade selection, "
             f"only that the question can now be legitimately tested. Simple correlation is not sufficient; "
             f"the actual test (incremental predictive value beyond the existing XAU signal, validated OOS) "
-            f"is a separate, not-yet-started research phase._"
+            f"is a separate, not-yet-started research phase."
         )
     else:
         lines.append("*CLASSIFICATION: DATA SOURCE INSUFFICIENT*")
