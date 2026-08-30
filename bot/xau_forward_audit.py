@@ -240,8 +240,13 @@ async def run_audit(spread_pct: float | None = None):
 
     lines = [
         "*🔍 XAU Forward-Test Audit: Baseline vs 1.0R Candidate*",
-        f"_Read-only audit of already-collected live data. `bot/xau_swing.py` and both strategies are untouched. "
-        f"Cost assumption: {spread_pct:.2f}% spread (XAU default)._\n",
+        # NOT wrapped in italics -- Telegram's legacy Markdown parser does
+        # not reliably support a backtick code-span nested inside an
+        # italic span, even when the character counts technically pair up
+        # (confirmed failing in production with "can't find end of the
+        # entity"). Keep code spans and italic spans mutually exclusive.
+        f"Read-only audit of already-collected live data. `bot/xau_swing.py` and both strategies are untouched. "
+        f"Cost assumption: {spread_pct:.2f}% spread (XAU default).\n",
     ]
 
     lines += _fmt_stats_block("FORWARD -- Baseline (TP1=0.667R)", baseline_stats)
