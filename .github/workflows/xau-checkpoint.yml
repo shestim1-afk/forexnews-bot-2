@@ -1,0 +1,56 @@
+name: XAU Forward-Test Checkpoint
+
+# Manual-only. Comprehensive evidence-review checkpoint: resolved/open
+# trades, holding time, streaks, concentration, LONG/SHORT split,
+# candidate-vs-baseline mechanical pairing, extended risk-level
+# economics (0.25% to 2.00%), reliability classification, and a
+# mechanical decision-tree recommendation. Read-only -- does NOT modify
+# bot/xau_swing.py or either live configuration. Sends 3 separate
+# Telegram messages given the amount of detail involved.
+on:
+  workflow_dispatch:
+    inputs:
+      spread_pct:
+        description: "Round-trip spread cost as % of price (leave blank for the XAU default)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  xau-checkpoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run checkpoint analysis
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.xau_checkpoint import run_checkpoint
+          spread = '${{ github.event.inputs.spread_pct }}'.strip().replace(',', '.')
+          asyncio.run(run_checkpoint(spread_pct=float(spread) if spread else None))
+          "
