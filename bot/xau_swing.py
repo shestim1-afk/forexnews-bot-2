@@ -255,7 +255,16 @@ async def evaluate_outcomes(symbol_tag: str = SYMBOL_TAG, strategy_type: str = S
 
     for signal_id, action, entry, sl, tp1, tp2, created_at in rows:
         created_dt = datetime.fromisoformat(created_at)
-        age_hours = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600
+        if created_dt.tzinfo is not None:
+            # Normalize to naive UTC -- matches the naive-datetime convention
+            # Twelve Data's own fetched dataframes use everywhere else in
+            # this project. Comparing a tz-aware created_dt directly against
+            # find_outcome_detailed's naive df_5m datetime column crashes
+            # unconditionally with "Cannot compare tz-naive and tz-aware
+            # datetime-like objects" -- confirmed happening on every call.
+            created_dt = created_dt.replace(tzinfo=None)
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        age_hours = (now_naive - created_dt).total_seconds() / 3600
         window_fully_elapsed = age_hours >= config.XAU_SWING_LOOKAHEAD_HOURS
 
         df_5m = fetch_full_history(API_SYMBOL, "5min")
