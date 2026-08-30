@@ -47,6 +47,6 @@ jobs:
         run: |
           python -c "
           import asyncio
-          from bot.xau_swing import evaluate_outcomes
-          asyncio.run(evaluate_outcomes())
+          from bot.xau_swing import evaluate_all_outcomes
+          asyncio.run(evaluate_all_outcomes())
           "
