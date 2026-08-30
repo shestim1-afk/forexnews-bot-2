@@ -1,0 +1,78 @@
+name: ML Study 1 - XAU Signal Quality
+
+# Manual-only. Runs the frozen ML development experiment (Control A =
+# TP1=0.667R baseline, Control B = TP1=1.0R candidate, run separately).
+# Model/threshold selection uses ONLY development data (2025-01-01 to
+# 2025-08-31) -- OOS is a SEPARATE, explicitly-invoked phase, never run
+# automatically. Does not modify bot/xau_swing.py or either live
+# configuration.
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "development or oos -- only run oos after development is reviewed and explicitly approved"
+        required: false
+        default: "development"
+      config:
+        description: "baseline (TP1=0.667R) or candidate (TP1=1.0R)"
+        required: false
+        default: "baseline"
+      model_name:
+        description: "Required for phase=oos only: the exact frozen model from the development report (e.g. random_forest)"
+        required: false
+        default: ""
+      threshold:
+        description: "Required for phase=oos only: the exact frozen threshold from the development report"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ml-study-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run ML study
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from research.ml_xau import run_development, run_oos
+          phase = '${{ github.event.inputs.phase }}'
+          config = '${{ github.event.inputs.config }}'
+          if phase == 'development':
+              asyncio.run(run_development(config))
+          elif phase == 'oos':
+              model_name = '${{ github.event.inputs.model_name }}'.strip()
+              threshold = '${{ github.event.inputs.threshold }}'.strip()
+              if not model_name or not threshold:
+                  raise ValueError('model_name and threshold are required for phase=oos -- use the exact values from the development report')
+              asyncio.run(run_oos(config, model_name, float(threshold)))
+          else:
+              raise ValueError(f'Unknown phase: {phase}')
+          "
