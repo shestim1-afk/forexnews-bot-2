@@ -43,4 +43,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -m bot.xau_checkpoint_monitor
+        run: |
+          python -c "
+          import asyncio
+          from bot.xau_checkpoint_monitor import run_all_checks
+          asyncio.run(run_all_checks())
+          "
