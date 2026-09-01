@@ -196,5 +196,88 @@ async def check_and_notify():
         logger.warning("Checkpoint-ready notification send FAILED -- state NOT marked notified, will retry next run.")
 
 
+BASELINE_PULSE_CHECKPOINT_NAME = "xau_baseline_pulse_15"
+BASELINE_PULSE_THRESHOLD = 15
+
+
+async def check_and_notify_baseline_pulse(spread_pct: float | None = None):
+    """A DELIBERATELY narrower, faster, lower-bar check than the real
+    30-trade checkpoint: does the baseline's forward performance look
+    roughly consistent with its historical +0.403 R/day, or does it look
+    like something has changed? This does NOT compare against the
+    candidate, does NOT constitute a checkpoint, and is explicitly
+    labeled PRELIMINARY every time it fires -- it answers a narrower
+    question (has the baseline degraded) sooner, precisely because that
+    question doesn't require candidate parity to be meaningful. The real
+    30-trade checkpoint (check_and_notify) is unaffected and still the
+    only thing that triggers a full baseline-vs-candidate decision."""
+    from .analytics import get_default_spread_pct
+    from .xau_forward_audit import get_forward_trades, compute_full_stats, HISTORICAL_BASELINE_NET_R_DAY
+
+    spread_pct = spread_pct if spread_pct is not None else get_default_spread_pct("XAU/USD")
+    baseline_resolved = get_resolved_count(SYMBOL_TAG, STRATEGY_TYPE)
+
+    if baseline_resolved < BASELINE_PULSE_THRESHOLD:
+        logger.info("Baseline pulse NOT READY -- %d/%d (%d more needed)",
+                    baseline_resolved, BASELINE_PULSE_THRESHOLD, BASELINE_PULSE_THRESHOLD - baseline_resolved)
+        return
+
+    if is_notified(BASELINE_PULSE_CHECKPOINT_NAME):
+        logger.info("Baseline pulse threshold reached (%d) but already notified previously -- no duplicate.", baseline_resolved)
+        return
+
+    trades = get_forward_trades(SYMBOL_TAG, STRATEGY_TYPE)
+    stats = compute_full_stats(trades, spread_pct)
+    net_r_day = stats.get("net_r_day")
+
+    if net_r_day is None:
+        direction_note = "Could not compute a net R/day figure -- insufficient underlying data despite the trade count."
+    elif net_r_day >= HISTORICAL_BASELINE_NET_R_DAY * 0.5:
+        direction_note = "Roughly consistent with the historical figure so far -- not evidence of degradation, but still far too small a sample to confirm the edge is intact."
+    elif net_r_day > 0:
+        direction_note = "Positive, but meaningfully below the historical figure -- worth watching, not yet evidence of a real problem at this sample size."
+    else:
+        direction_note = "Currently negative -- worth watching closely, but n is still small enough that this could easily reverse with a few more trades."
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    net_r_day_str = f"{net_r_day:+.3f}" if net_r_day is not None else "N/A"
+    pf_str = f"{stats['profit_factor']:.2f}" if stats.get("profit_factor") is not None else "N/A"
+    wr_str = f"{stats['win_rate']*100:.0f}%" if stats.get("win_rate") is not None else "N/A"
+
+    message = (
+        "*XAU BASELINE PRELIMINARY PULSE CHECK*\n\n"
+        f"PRELIMINARY -- baseline has reached {baseline_resolved} resolved trades ({BASELINE_PULSE_THRESHOLD}-trade "
+        f"early-look threshold), as of {now_str}.\n\n"
+        "This is NOT the real 30-trade checkpoint and does NOT include the candidate. It exists only to give an "
+        "early, low-confidence read on whether the baseline still looks broadly consistent with its historical "
+        "performance -- nothing here should inform any strategy or risk decision.\n\n"
+        f"Forward net R/day: {net_r_day_str} (historical: {HISTORICAL_BASELINE_NET_R_DAY:+.3f})\n"
+        f"Win rate: {wr_str}, Profit factor: {pf_str}\n\n"
+        f"{direction_note}\n\n"
+        "This message will not repeat. The real checkpoint notification arrives separately once both baseline "
+        "and candidate reach 30 resolved trades."
+    )
+
+    try:
+        send_succeeded = _send_telegram_direct(message)
+    except Exception as e:
+        logger.error("Unexpected error while attempting to send baseline pulse notification: %s", e)
+        send_succeeded = False
+
+    if send_succeeded:
+        mark_notified(BASELINE_PULSE_CHECKPOINT_NAME)
+        logger.info("Baseline pulse notification sent successfully and marked notified.")
+    else:
+        logger.warning("Baseline pulse notification send FAILED -- state NOT marked notified, will retry next run.")
+
+
+async def run_all_checks():
+    """Runs both the real 30-trade checkpoint check and the narrower,
+    faster baseline-only pulse check -- called by the scheduled
+    workflow's entry point."""
+    await check_and_notify()
+    await check_and_notify_baseline_pulse()
+
+
 if __name__ == "__main__":
-    asyncio.run(check_and_notify())
+    asyncio.run(run_all_checks())
