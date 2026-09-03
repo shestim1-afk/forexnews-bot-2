@@ -1,0 +1,36 @@
+name: Carry and Vol Premium Feasibility Probe
+
+# Manual-only. Closes the two remaining unverified items from the
+# original research map (carry, volatility risk premium) -- both were
+# previously flagged as likely blocked but never empirically confirmed.
+# DATA AVAILABILITY CHECK ONLY -- no strategy built, no backtest run,
+# production bot untouched.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  carry-volpremium-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run carry / vol premium feasibility probe
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python -m bot.carry_volpremium_probe
