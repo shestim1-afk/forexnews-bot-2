@@ -1,0 +1,38 @@
+name: Congress and Insider Trading Data Probe
+
+# Manual-only. Checks whether Congress trading disclosure data (House)
+# and SEC insider Form 4 data are usable, plus a price-data cross-check
+# for sample tickers. DATA AVAILABILITY CHECK ONLY -- no strategy built,
+# no backtest run, production bot untouched. The House data source has
+# already been directly verified with real data before this workflow was
+# built; the SEC EDGAR check is the one piece that could not be verified
+# in advance.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  congress-insider-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Congress and insider data probe
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python -m bot.congress_insider_probe
