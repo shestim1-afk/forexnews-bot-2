@@ -1,0 +1,58 @@
+name: BTC S/R Scalp Test
+
+# Manual-only. Tests the frozen BTC daily/weekly support-resistance
+# mean-reversion scalp hypothesis. Pre-declared two-tier test: run
+# level_timeframe=daily first; only if that result is net non-positive
+# should level_timeframe=weekly be run on the same period. No live/
+# forward-test code is touched.
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "2025 or 2024"
+        required: false
+        default: "2025"
+      level_timeframe:
+        description: "daily (run first) or weekly (only if daily is net non-positive)"
+        required: false
+        default: "daily"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  btc-sr-scalp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore shared database
+        uses: actions/cache@v4
+        with:
+          path: data/seen.sqlite3
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Run BTC S/R scalp test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.btc_sr_scalp import run
+          asyncio.run(run(period='${{ github.event.inputs.period }}', level_timeframe='${{ github.event.inputs.level_timeframe }}'))
+          "
