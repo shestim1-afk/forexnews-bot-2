@@ -1,0 +1,35 @@
+name: BTC Funding Rate Feasibility Probe
+
+# Manual-only. Tests a genuinely NEW data source (Binance's public
+# futures API, no key required) for a market-neutral funding-rate
+# harvesting hypothesis -- distinct from every directional BTC test run
+# so far in this project. DATA AVAILABILITY CHECK ONLY -- no strategy
+# built, no backtest run, production bot untouched.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  btc-funding-rate-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run BTC funding rate feasibility probe
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m bot.btc_funding_rate_probe
