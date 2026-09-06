@@ -1,0 +1,54 @@
+name: Congress Trading Backtest
+
+# Manual-only. Frozen specification: any disclosed "Purchase" transaction
+# from House Congress trading disclosures, entry at the next trading day
+# after the DISCLOSURE date (not transaction date -- avoids lookahead).
+# Restricted to the top 150 most-frequently-disclosed tickers for
+# practical runtime/API-quota reasons. 21-trading-day hold, 0.10%
+# round-trip cost. Development period only unless explicitly run with
+# period=oos after development is reviewed and approved.
+# Does NOT touch bot/xau_swing.py or any live/forward-test code.
+#
+# NOTE ON RUNTIME: fetches price history for up to 150 distinct tickers,
+# each paced to stay within Twelve Data's free-tier rate limit (8
+# requests/minute) -- expect this to take at least 20-25 minutes. This
+# is intentional, not a sign of a problem.
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "dev or oos -- only run oos after dev is reviewed and approved as DEVELOPMENT PROMISING"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  congress-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Congress trading backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.congress_backtest import run_period
+          asyncio.run(run_period(period='${{ github.event.inputs.period }}'))
+          "
