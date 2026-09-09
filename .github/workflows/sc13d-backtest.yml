@@ -1,0 +1,53 @@
+name: SC 13D Individual-Filer Backtest
+
+# Manual-only. Frozen specification: INITIAL Schedule 13D filings only
+# (excludes 13D/A amendments and 13G), individual filers only (checked
+# against each filing's real header, not the daily index). 21-day hold,
+# 0.10% cost. Development period only unless explicitly run with
+# period=oos after development is reviewed and approved.
+# Does NOT touch bot/xau_swing.py or any live/forward-test code.
+#
+# NOTE ON RUNTIME: scans SEC's daily index day-by-day across the full
+# period, then fetches each initial SC 13D filing's real header content
+# individually, paced to respect SEC's fair-access guidance. This is the
+# most SEC-request-intensive workflow built so far -- expect this to
+# take well over an hour. The generous timeout below is intentional.
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "dev or oos -- only run oos after dev is reviewed and approved as DEVELOPMENT PROMISING"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  sc13d-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run SC 13D individual-filer backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from bot.sc13d_backtest import run_period
+          asyncio.run(run_period(period='${{ github.event.inputs.period }}'))
+          "
