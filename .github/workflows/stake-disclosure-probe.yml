@@ -1,0 +1,39 @@
+name: Stake Disclosure Feasibility Probe
+
+# Manual-only. Checks whether SEC EDGAR's full-text search can reliably
+# surface 13D/13G individual stake disclosures in near-real-time -- the
+# mechanism behind the Markiplier/GoPro case. DATA AVAILABILITY CHECK
+# ONLY -- no strategy built, no backtest run, production bot untouched.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe (main data check) or diagnostic (resolves filer-vs-subject naming, real filings)"
+        required: false
+        default: "probe"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  stake-disclosure-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stake disclosure feasibility probe
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m bot.stake_disclosure_probe ${{ github.event.inputs.mode }}
