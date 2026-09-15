@@ -1,19 +1,6 @@
 """Historical backtest: replays the SAME decision logic used by the live
 scalp bot against past price data, to see what it would have decided at
 each point in time -- without letting it "see" any future candles.
-
-NEW: atr_timeframe lets you compute SL/TP width from a HIGHER timeframe's
-ATR (1h, 4h) instead of the tight 5-minute one the live bot uses by
-default. This exists because we found, with real data, that 5m-ATR-based
-stops are so tight that even a modest spread cost erases 30-70% of the
-entire risk unit -- every strategy type came back net negative after
-costs. Using a wider timeframe's ATR for the stop distance mechanically
-shrinks that cost's share of risk, at the cost of holding trades longer
-and getting fewer of them per day (which was explicitly requested: aiming
-for ~5 trades/day, not dozens).
-
-lookahead_hours is now configurable (default 24) since wider, swing-style
-stops can genuinely take days to resolve, not hours.
 """
 
 import asyncio
@@ -39,7 +26,7 @@ WARMUP_BARS = 250
 LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT = 24
 
 
-def fetch_full_history(api_symbol: str, interval: str, outputsize: int = 5000) -> pd.DataFrame | None:
+def fetch_full_history(api_symbol: str, interval: str, outputsize: int = 5000):
     if not scalp_analysis.TWELVEDATA_API_KEY:
         return None
     try:
@@ -66,7 +53,7 @@ def fetch_full_history(api_symbol: str, interval: str, outputsize: int = 5000) -
         return None
 
 
-def slice_up_to(df: pd.DataFrame, cutoff_dt, window: int = WARMUP_BARS) -> pd.DataFrame | None:
+def slice_up_to(df, cutoff_dt, window: int = WARMUP_BARS):
     sliced = df[df["datetime"] <= cutoff_dt]
     if len(sliced) < window:
         return None
@@ -74,7 +61,7 @@ def slice_up_to(df: pd.DataFrame, cutoff_dt, window: int = WARMUP_BARS) -> pd.Da
 
 
 def fetch_paginated_history(api_symbol: str, interval: str, target_start: datetime, target_end: datetime,
-                             chunk_size: int = 5000, request_delay: float = 8.0, max_retries: int = 2) -> pd.DataFrame | None:
+                             chunk_size: int = 5000, request_delay: float = 8.0, max_retries: int = 2):
     if not scalp_analysis.TWELVEDATA_API_KEY:
         return None
     all_chunks = []
@@ -142,7 +129,7 @@ def fetch_paginated_history(api_symbol: str, interval: str, target_start: dateti
     return combined[combined["datetime"] >= target_start].reset_index(drop=True)
 
 
-def compute_trade_levels_variant(action: str, entry: float, atr: float, sl_mult: float, tp1_mult: float, tp2_mult: float) -> dict:
+def compute_trade_levels_variant(action: str, entry: float, atr: float, sl_mult: float, tp1_mult: float, tp2_mult: float):
     if action == "LONG":
         return {"entry": entry, "sl": entry - sl_mult * atr, "tp1": entry + tp1_mult * atr, "tp2": entry + tp2_mult * atr}
     elif action == "SHORT":
@@ -151,12 +138,7 @@ def compute_trade_levels_variant(action: str, entry: float, atr: float, sl_mult:
 
 
 def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0,
-                 atr_timeframe: str = "5m") -> tuple[dict, dict, dict | None, str | None, dict | None, dict | None] | None:
-    """atr_timeframe selects which timeframe's ATR sets the SL/TP distance
-    -- '5m' (the live bot's default, tight/scalp-style), '15m', '1h', or
-    '4h' (wider, swing-style, meant to survive real spread costs better).
-    Entry price is always the current 5m close regardless of which ATR is
-    used for sizing the stop -- only the WIDTH of SL/TP changes."""
+                 atr_timeframe: str = "5m"):
     tf_data, dfs = {}, {}
     for label in ["4h", "1h", "15m", "5m"]:
         sliced = slice_up_to(dfs_full[label], cutoff_dt)
@@ -178,13 +160,9 @@ def evaluate_at(cutoff_dt, dfs_full: dict, sl_mult: float = 1.5, tp1_mult: float
     return tf_data, decision, levels, divergence, range_setup, sweep, breakout_retest
 
 
-def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl: float,
-                           tp1: float, tp2: float | None, action: str,
-                           lookahead_hours: float = LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT) -> dict:
-    """Same WIN/LOSS/EXPIRED/MAE/MFE logic as before. lookahead_hours is now
-    a parameter (not a fixed global) since wider, swing-style stops can
-    genuinely take days to resolve, not hours -- a 24-hour window would
-    incorrectly mark many genuinely-still-open swing trades as EXPIRED."""
+def find_outcome_detailed(df_5m_full, entry_time, entry: float, sl: float,
+                           tp1: float, tp2, action: str,
+                           lookahead_hours: float = LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT):
     window_end = entry_time + timedelta(hours=lookahead_hours)
     forward = df_5m_full[(df_5m_full["datetime"] > entry_time) & (df_5m_full["datetime"] <= window_end)].reset_index(drop=True)
     risk = abs(entry - sl)
@@ -269,8 +247,8 @@ def find_outcome_detailed(df_5m_full: pd.DataFrame, entry_time, entry: float, sl
     return result
 
 
-def process_signal_type(strategy_type: str, action: str | None, entry: float | None, sl: float | None,
-                         tp1: float | None, tp2: float | None, confidence: float, details: str,
+def process_signal_type(strategy_type: str, action, entry, sl,
+                         tp1, tp2, confidence: float, details: str,
                          t: datetime, dfs_full: dict, tracker: dict, result_symbol: str,
                          log_no_signal: bool = False, lookahead_hours: float = LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT) -> str:
     if action is None:
@@ -313,13 +291,8 @@ def process_signal_type(strategy_type: str, action: str | None, entry: float | N
 
 async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
               sl_mult: float = 1.5, tp1_mult: float = 1.0, tp2_mult: float = 2.0,
-              deep_start_date: str | None = None, deep_end_date: str | None = None,
-              atr_timeframe: str = "5m", lookahead_hours: float | None = None):
-    """atr_timeframe: '5m' (live bot default) / '15m' / '1h' / '4h' -- which
-    timeframe's ATR sets the SL/TP width. lookahead_hours: how long to wait
-    for TP/SL before marking EXPIRED -- defaults to 24h for 5m/15m, but
-    auto-extends to 168h (7 days) for 1h/4h unless you override it, since
-    wider stops genuinely take longer to resolve."""
+              deep_start_date=None, deep_end_date=None,
+              atr_timeframe: str = "5m", lookahead_hours=None):
     if lookahead_hours is None:
         lookahead_hours = 168.0 if atr_timeframe in ("1h", "4h") else LOOKAHEAD_HOURS_FOR_OUTCOME_DEFAULT
 
@@ -336,9 +309,21 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
 
     logger.info("Fetching historical data for %s...", display_symbol)
     dfs_full = {}
-    if deep_start_date and deep_end_date:
+    if deep_start_date:
+        # FIX: this previously required BOTH deep_start_date AND
+        # deep_end_date to be set (`if deep_start_date and deep_end_date`),
+        # silently falling through to the short-window default whenever
+        # deep_end_date was left blank -- even though the workflow's own
+        # field description tells the user to leave deep_end_date blank
+        # to mean "now". Confirmed via a real run's logs: deep_start_date
+        # was correctly received but completely ignored because
+        # deep_end_date was empty. Now deep_end_date is genuinely
+        # optional, defaulting to the current time.
         target_start = datetime.strptime(deep_start_date, "%Y-%m-%d").replace(tzinfo=None)
-        target_end = datetime.strptime(deep_end_date, "%Y-%m-%d").replace(tzinfo=None) + timedelta(days=1)
+        target_end = (
+            datetime.strptime(deep_end_date, "%Y-%m-%d").replace(tzinfo=None) + timedelta(days=1)
+            if deep_end_date else datetime.now()
+        )
         for label, interval in scalp_analysis.TIMEFRAMES.items():
             df = fetch_paginated_history(api_symbol, interval, target_start, target_end)
             if df is None or len(df) < WARMUP_BARS:
@@ -395,10 +380,6 @@ async def run(api_symbol: str = "BTC/USD", display_symbol: str = "BTC/USD",
         elif status == "continuation":
             totals["continuations"] += 1
 
-        # Range/sweep/breakout still use their own SL logic (level-anchored,
-        # not the chosen atr_timeframe) -- multi-timeframe stop testing is
-        # scoped to trend here, since that's the one strategy with any
-        # real evidence behind it worth testing further
         if range_setup:
             r_action, r_entry, r_sl, r_tp1, r_details = (
                 range_setup["direction"], range_setup["entry"], range_setup["sl"], range_setup["tp"], range_setup["reason"],
