@@ -315,5 +315,69 @@ async def run_extended_dogecoin():
     logger.info("Sent DOGE/USD confluence backtest report")
 
 
+async def run_dogecoin_dev_oos_split():
+    """Retroactive dev/OOS check on the ALREADY-COLLECTED DOGE data --
+    since the specification was frozen before ever seeing DOGE data at
+    all, splitting the available history chronologically into a dev
+    portion (first ~70%) and an OOS portion (last ~30%) is an honest way
+    to check consistency now, without waiting months for genuinely new
+    data to accumulate. SAME frozen rules applied to both halves,
+    unchanged."""
+    lines = [
+        "*2-of-3 Confluence Strategy -- DOGE/USD Dev/OOS Split*",
+        "Same frozen specification. Retroactive split of already-collected data into dev (first ~70%) and "
+        "OOS (last ~30%) portions -- an honest consistency check, not a true prospective OOS test.\n",
+    ]
+
+    df = fetch_full_history("DOGE/USD", "1day", outputsize=1000)
+    if df is None or len(df) < MA_SLOW + 100:
+        lines.append("Insufficient data retrieved -- could not run the split.")
+        _send_telegram_direct("\n".join(lines))
+        return
+
+    df = df.reset_index(drop=True)
+    split_idx = int(len(df) * 0.7)
+    # Both halves need MA_SLOW warmup bars of their OWN preceding data to
+    # compute indicators correctly -- the OOS half reuses the tail of the
+    # dev half's data for warmup, but only trades/signals occurring AFTER
+    # the split point count toward its own results.
+    dev_df = df.iloc[:split_idx].reset_index(drop=True)
+    oos_df = df.iloc[max(0, split_idx - MA_SLOW - 10):].reset_index(drop=True)
+    oos_start_date = df.iloc[split_idx]["datetime"]
+
+    dev_result = run_backtest_on_df(dev_df)
+    oos_result_full = run_backtest_on_df(oos_df)
+
+    lines.append(f"Full data: {df['datetime'].min().date()} to {df['datetime'].max().date()} ({len(df)} candles)")
+    lines.append(f"Split point: {oos_start_date.date()}\n")
+
+    for label, result in [("DEV", dev_result), ("OOS", oos_result_full)]:
+        if result["n"] == 0:
+            lines.append(f"*{label}*: no trades triggered.")
+        else:
+            pf_str = f"{result['profit_factor']:.2f}" if result["profit_factor"] is not None else "N/A"
+            lines.append(
+                f"*{label}*: n={result['n']}, win rate={result['win_rate']*100:.0f}%, "
+                f"avg R={result['avg_r']:+.3f}, PF={pf_str}, max DD={result['max_dd_r']:.2f}R"
+            )
+    lines.append("")
+
+    if dev_result["n"] > 0 and oos_result_full["n"] > 0:
+        dev_positive = dev_result["avg_r"] > 0
+        oos_positive = oos_result_full["avg_r"] > 0
+        oos_adequate = oos_result_full["n"] >= 15  # smaller OOS slice, lower bar acknowledged explicitly
+        if not oos_adequate:
+            lines.append(f"*CLASSIFICATION: INCONCLUSIVE -- OOS sample (n={oos_result_full['n']}) too small even for this reduced check.*")
+        elif dev_positive and oos_positive:
+            lines.append("*CLASSIFICATION: CONSISTENT -- edge held its sign across both halves. Still not a substitute for genuine forward testing.*")
+        else:
+            lines.append("*CLASSIFICATION: DID NOT HOLD -- edge reversed or disappeared in the OOS half.*")
+    else:
+        lines.append("*CLASSIFICATION: INCONCLUSIVE -- one or both halves had no trades.*")
+
+    _send_telegram_direct("\n".join(lines))
+    logger.info("Sent DOGE dev/OOS split report")
+
+
 if __name__ == "__main__":
     asyncio.run(run())
