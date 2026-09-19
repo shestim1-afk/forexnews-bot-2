@@ -36,7 +36,7 @@ import pandas as pd
 import numpy as np
 
 from . import config
-from .historical_backtest import fetch_full_history
+from .historical_backtest import fetch_full_history, fetch_paginated_history
 
 import requests
 
@@ -222,6 +222,51 @@ async def run():
 
     _send_telegram_direct("\n".join(lines))
     logger.info("Sent confluence backtest report")
+
+
+async def run_extended_xau():
+    """SAME frozen specification as run() -- no parameter changes -- just
+    applied to the FULL available XAU/USD daily history (back to
+    2020-01-24, confirmed available earlier in this project) instead of
+    the default 2-year window, to see whether the 2-year result (n=43,
+    +0.201 avg R) holds up with a real, adequately-sized sample."""
+    lines = [
+        "*2-of-3 Confluence Strategy Backtest -- EXTENDED WINDOW (XAU/USD only)*",
+        "SAME frozen specification as the 2-year test -- no parameter changes. Full available daily history "
+        f"(back to 2020-01-24), to check whether the 2-year result (n=43, +0.201 avg R) holds with a real sample.\n",
+    ]
+
+    target_start = datetime(2020, 1, 24)
+    logger.info("Fetching full XAU/USD daily history back to %s...", target_start.date())
+    df = fetch_paginated_history("XAU/USD", "1day", target_start, datetime.now())
+
+    if df is None or len(df) < MA_SLOW + 50:
+        lines.append("Insufficient data retrieved -- could not run the extended test.")
+        _send_telegram_direct("\n".join(lines))
+        return
+
+    lines.append(f"Data: {df['datetime'].min().date()} to {df['datetime'].max().date()} ({len(df)} daily candles)")
+    result = run_backtest_on_df(df)
+
+    if result["n"] == 0:
+        lines.append("No trades triggered across the full period.")
+    else:
+        pf_str = f"{result['profit_factor']:.2f}" if result["profit_factor"] is not None else "N/A"
+        lines.append(
+            f"n={result['n']}, win rate={result['win_rate']*100:.0f}%, avg R={result['avg_r']:+.3f}, "
+            f"PF={pf_str}, max DD={result['max_dd_r']:.2f}R"
+        )
+        lines.append("")
+        adequate = result["n"] >= 30
+        if not adequate:
+            lines.append("*CLASSIFICATION: INCONCLUSIVE -- still below the 30-trade minimum.*")
+        elif result["avg_r"] > 0 and (result["profit_factor"] or 0) > 1.0:
+            lines.append("*CLASSIFICATION: PROMISING -- net positive with an adequate sample. Still needs OOS confirmation before any real use.*")
+        else:
+            lines.append("*CLASSIFICATION: FAILED -- did not hold up on the full available history.*")
+
+    _send_telegram_direct("\n".join(lines))
+    logger.info("Sent extended confluence backtest report")
 
 
 if __name__ == "__main__":
