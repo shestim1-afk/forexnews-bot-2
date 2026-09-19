@@ -269,5 +269,51 @@ async def run_extended_xau():
     logger.info("Sent extended confluence backtest report")
 
 
+async def run_extended_dogecoin():
+    """SAME frozen specification, unchanged -- applied to DOGE/USD as one
+    additional, honest data point. Not a search across many assets: this
+    is the one additional instrument tested, reported regardless of
+    outcome, same as XAU and BTC before it."""
+    lines = [
+        "*2-of-3 Confluence Strategy Backtest -- DOGE/USD*",
+        "SAME frozen specification, no changes. One additional instrument tested honestly, not a search "
+        "across many assets for a hit.\n",
+    ]
+
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365 * 2 + 250)
+    logger.info("Fetching daily data for DOGE/USD...")
+    df = fetch_full_history("DOGE/USD", "1day", outputsize=1000)
+
+    if df is None or len(df) < MA_SLOW + 50:
+        lines.append("Insufficient data retrieved for DOGE/USD -- could not run the test.")
+        _send_telegram_direct("\n".join(lines))
+        return
+
+    df = df[df["datetime"] >= start_date].reset_index(drop=True)
+    lines.append(f"Data: {df['datetime'].min().date()} to {df['datetime'].max().date()} ({len(df)} daily candles)")
+    result = run_backtest_on_df(df)
+
+    if result["n"] == 0:
+        lines.append("No trades triggered in this period.")
+    else:
+        pf_str = f"{result['profit_factor']:.2f}" if result["profit_factor"] is not None else "N/A"
+        lines.append(
+            f"n={result['n']}, win rate={result['win_rate']*100:.0f}%, avg R={result['avg_r']:+.3f}, "
+            f"PF={pf_str}, max DD={result['max_dd_r']:.2f}R"
+        )
+        lines.append("")
+        adequate = result["n"] >= 30
+        if not adequate:
+            lines.append("*CLASSIFICATION: INCONCLUSIVE -- below the 30-trade minimum.*")
+        elif result["avg_r"] > 0 and (result["profit_factor"] or 0) > 1.0:
+            lines.append("*CLASSIFICATION: PROMISING -- still needs OOS confirmation and a trade-frequency check before any real use.*")
+        else:
+            lines.append("*CLASSIFICATION: FAILED.*")
+
+    _send_telegram_direct("\n".join(lines))
+    logger.info("Sent DOGE/USD confluence backtest report")
+
+
 if __name__ == "__main__":
     asyncio.run(run())
