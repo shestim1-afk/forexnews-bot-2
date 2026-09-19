@@ -1,14 +1,12 @@
 name: Confluence Strategy Backtest
 
-# Manual-only. Frozen specification: 2-of-3 majority (Donchian breakout,
-# 50/200 MA crossover, MACD), daily candles, 2-year window, XAU/USD and
-# BTC/USD both reported. DELIBERATELY uses daily data (not intraday) so
-# each instrument needs only a single API call -- designed to run in
-# minutes, not hours, avoiding the pagination/rate-limit issues seen
-# elsewhere in this project today. Does NOT touch bot/xau_swing.py or
-# any live/forward-test code.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "2year (original test) or extended (full XAU history, same frozen spec, no changes)"
+        required: false
+        default: "2year"
 
 permissions:
   contents: read
@@ -35,4 +33,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-        run: python -m bot.confluence_backtest
+        run: |
+          python -c "
+          import asyncio
+          from bot.confluence_backtest import run, run_extended_xau
+          mode = '${{ github.event.inputs.mode }}'
+          asyncio.run(run_extended_xau() if mode == 'extended' else run())
+          "
