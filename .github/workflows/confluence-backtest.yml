@@ -1,10 +1,18 @@
 name: Confluence Strategy Backtest
 
+# Manual-only. Frozen specification: 2-of-3 majority (Donchian breakout,
+# 50/200 MA crossover, MACD), daily candles. XAU/USD and BTC/USD tested
+# first, then DOGE/USD as one additional honest data point, then a
+# retroactive dev/OOS consistency check on DOGE. DELIBERATELY uses daily
+# data (not intraday) so each instrument needs only a single API call --
+# designed to run in minutes, not hours, avoiding the pagination/rate-
+# limit issues seen elsewhere in this project today. Does NOT touch
+# bot/xau_swing.py or any live/forward-test code.
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "2year (original XAU+BTC test), extended (full XAU history), or doge (DOGE/USD, same frozen spec)"
+        description: "2year (XAU+BTC), extended (full XAU), doge (DOGE/USD), or dogesplit (DOGE dev/OOS check)"
         required: false
         default: "2year"
 
@@ -36,12 +44,14 @@ jobs:
         run: |
           python -c "
           import asyncio
-          from bot.confluence_backtest import run, run_extended_xau, run_extended_dogecoin
+          from bot.confluence_backtest import run, run_extended_xau, run_extended_dogecoin, run_dogecoin_dev_oos_split
           mode = '${{ github.event.inputs.mode }}'
           if mode == 'extended':
               asyncio.run(run_extended_xau())
           elif mode == 'doge':
               asyncio.run(run_extended_dogecoin())
+          elif mode == 'dogesplit':
+              asyncio.run(run_dogecoin_dev_oos_split())
           else:
               asyncio.run(run())
           "
