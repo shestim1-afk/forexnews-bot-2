@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "2year (original test) or extended (full XAU history, same frozen spec, no changes)"
+        description: "2year (original XAU+BTC test), extended (full XAU history), or doge (DOGE/USD, same frozen spec)"
         required: false
         default: "2year"
 
@@ -36,7 +36,12 @@ jobs:
         run: |
           python -c "
           import asyncio
-          from bot.confluence_backtest import run, run_extended_xau
+          from bot.confluence_backtest import run, run_extended_xau, run_extended_dogecoin
           mode = '${{ github.event.inputs.mode }}'
-          asyncio.run(run_extended_xau() if mode == 'extended' else run())
+          if mode == 'extended':
+              asyncio.run(run_extended_xau())
+          elif mode == 'doge':
+              asyncio.run(run_extended_dogecoin())
+          else:
+              asyncio.run(run())
           "
