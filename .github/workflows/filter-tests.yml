@@ -1,7 +1,12 @@
 name: Volume and S/R Filter Tests
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "volumecheck (fast diagnostic), short (4-month, both filters), or extended (full history, S/R only)"
+        required: false
+        default: "volumecheck"
 
 permissions:
   contents: read
@@ -10,7 +15,7 @@ permissions:
 jobs:
   filter-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     steps:
       - name: Check out the code
         uses: actions/checkout@v4
@@ -28,4 +33,15 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-        run: python -m bot.filter_tests
+        run: |
+          python -c "
+          import asyncio
+          from bot.filter_tests import run, check_volume_data_quality, run_extended_sr_filter
+          mode = '${{ github.event.inputs.mode }}'
+          if mode == 'short':
+              asyncio.run(run())
+          elif mode == 'extended':
+              asyncio.run(run_extended_sr_filter())
+          else:
+              asyncio.run(check_volume_data_quality())
+          "
